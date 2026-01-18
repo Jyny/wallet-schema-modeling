@@ -18,6 +18,10 @@ GROUP BY wallet_id;
 INSERT INTO utxo_wallet (tx_id, wallet_id, amount, created_at)
 VALUES ($1, $2, $3, now());
 
+-- name: InsertUTXOWithoutTxID :exec
+INSERT INTO utxo_wallet (wallet_id, amount, created_at)
+VALUES ($1, $2, now());
+
 -- name: FindUnspentUTXOsGTETarget :many
 WITH RECURSIVE candidate AS (
     SELECT u.tx_id, u.wallet_id, u.amount, u.created_at, u.spent_at,
