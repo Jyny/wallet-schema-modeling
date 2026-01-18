@@ -8,7 +8,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
-	ulid "github.com/oklog/ulid/v2"
 	"github.com/shopspring/decimal"
 )
 
@@ -61,11 +60,22 @@ func (s *UTXOWalletRepo) UpdateWalletBalance(ctx context.Context, walletID int, 
 	}
 
 	if !delta.IsZero() {
-		err := s.queries.InsertUTXO(ctx, db.InsertUTXOParams{
-			TxID:     uuid.UUID(ulid.Make()),
+		newUUID, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		err = s.queries.InsertUTXO(ctx, db.InsertUTXOParams{
+			TxID:     newUUID,
 			WalletID: int32(walletID),
 			Amount:   decimalToNumeric(delta),
 		})
+
+		// gen uuidv7() in db
+		// err = s.queries.InsertUTXOWithoutTxID(ctx, db.InsertUTXOWithoutTxIDParams{
+		// 	WalletID: int32(walletID),
+		// 	Amount:   decimalToNumeric(delta),
+		// })
+
 		if err != nil {
 			return err
 		}

@@ -1,6 +1,6 @@
 -- Create utxo_wallet table
 CREATE TABLE utxo_wallet (
-    tx_id       UUID PRIMARY KEY,
+    tx_id       UUID PRIMARY KEY DEFAULT uuidv7(),
     wallet_id   INT NOT NULL,
     amount      NUMERIC(20,12) NOT NULL DEFAULT 0,
     created_at  TIMESTAMP NOT NULL DEFAULT now(),

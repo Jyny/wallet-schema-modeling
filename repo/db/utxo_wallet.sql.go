@@ -138,6 +138,21 @@ func (q *Queries) InsertUTXO(ctx context.Context, arg InsertUTXOParams) error {
 	return err
 }
 
+const insertUTXOWithoutTxID = `-- name: InsertUTXOWithoutTxID :exec
+INSERT INTO utxo_wallet (wallet_id, amount, created_at)
+VALUES ($1, $2, now())
+`
+
+type InsertUTXOWithoutTxIDParams struct {
+	WalletID int32          `db:"wallet_id" json:"wallet_id"`
+	Amount   pgtype.Numeric `db:"amount" json:"amount"`
+}
+
+func (q *Queries) InsertUTXOWithoutTxID(ctx context.Context, arg InsertUTXOWithoutTxIDParams) error {
+	_, err := q.db.Exec(ctx, insertUTXOWithoutTxID, arg.WalletID, arg.Amount)
+	return err
+}
+
 const markUTXOsAsSpent = `-- name: MarkUTXOsAsSpent :exec
 UPDATE utxo_wallet
 SET spent_at = now()
