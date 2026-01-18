@@ -11,9 +11,8 @@ type UTXOWallet struct {
 	TxID      uuid.UUID       `db:"tx_id"`
 	WalletID  int             `db:"wallet_id"`
 	Amount    decimal.Decimal `db:"amount"`
-	Spent     bool            `db:"spent"`
 	CreatedAt time.Time       `db:"created_at"`
-	UpdatedAt time.Time       `db:"updated_at"`
+	SpentAt   *time.Time      `db:"spent_at"`
 }
 
 type BalanceWallet struct {
