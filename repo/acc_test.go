@@ -12,7 +12,7 @@ import (
 
 func TestBalanceWalletGetWalletBalance(t *testing.T) {
 	db := setupTestDB(t)
-	repo := NewBalanceWalletRepo(db)
+	repo := NewAccWalletRepo(db)
 
 	wallet, err := repo.GetWalletBalance(context.Background(), 1)
 	require.NoError(t, err)
@@ -25,7 +25,7 @@ func TestBalanceWalletGetWalletBalance(t *testing.T) {
 
 func TestBalanceWalletUpdateWalletBalance(t *testing.T) {
 	db := setupTestDB(t)
-	repo := NewBalanceWalletRepo(db)
+	repo := NewAccWalletRepo(db)
 
 	delta := decimal.RequireFromString("100.123456789012")
 	_, err := repo.UpdateWalletBalance(context.Background(), 1, delta)
