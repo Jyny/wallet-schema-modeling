@@ -12,9 +12,8 @@ CREATE TABLE "utxo_wallet" (
   "wallet_id" integer NOT NULL,
   "amount" numeric(20,12) NOT NULL DEFAULT 0,
   "created_at" timestamp NOT NULL DEFAULT now(),
-  "updated_at" timestamp NOT NULL DEFAULT now(),
-  "spent" boolean NOT NULL DEFAULT false,
+  "spent_at" timestamp NULL,
   PRIMARY KEY ("tx_id")
 );
 -- Create index "utxo_wallet_unspent_wallet_txid" to table: "utxo_wallet"
-CREATE INDEX "utxo_wallet_unspent_wallet_txid" ON "utxo_wallet" ("wallet_id", "tx_id") WHERE (spent = false);
+CREATE INDEX "utxo_wallet_unspent_wallet_txid" ON "utxo_wallet" ("wallet_id", "tx_id") WHERE (spent_at IS NULL);
