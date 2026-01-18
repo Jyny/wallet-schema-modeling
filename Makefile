@@ -89,3 +89,27 @@ migrate.apply:
 .PHONY: migrate.status
 migrate.status:
 	$(ATLAS) migrate --env $(ATLAS_ENV) status
+
+
+# sqlc cli (via docker)
+SQLC_VERSION ?= 1.30.0
+SQLC ?= docker run --rm -v $(CURDIR):/src -w /src sqlc/sqlc:$(SQLC_VERSION)
+
+# generate go code from sql queries
+.PHONY: sqlc.generate
+sqlc.generate:
+	$(SQLC) generate
+
+# statically check SQL for syntax and type errors
+.PHONY: sqlc.compile
+sqlc.compile:
+	$(SQLC) compile
+
+.PHONY: sqlc.diff
+sqlc.diff:
+	$(SQLC) diff
+
+# vet sql queries
+.PHONY: sqlc.vet
+sqlc.vet:
+	$(SQLC) vet
