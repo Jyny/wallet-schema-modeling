@@ -21,7 +21,7 @@ func NewBalanceWalletRepo(db *pgxpool.Pool) *BalanceWalletRepo {
 func (s *BalanceWalletRepo) GetWalletBalance(ctx context.Context, walletID int) (*model.BalanceWallet, error) {
 	var wallet model.BalanceWallet
 
-	query := `SELECT wallet_id, amount, created_at, updated_at FROM balance_wallet WHERE wallet_id = $1 FOR UPDATE`
+	query := `SELECT wallet_id, amount, created_at, updated_at FROM acc_wallet WHERE wallet_id = $1 FOR UPDATE`
 	err := s.db.QueryRow(ctx, query, walletID).Scan(
 		&wallet.WalletID,
 		&wallet.Amount,
@@ -38,7 +38,7 @@ func (s *BalanceWalletRepo) GetWalletBalance(ctx context.Context, walletID int) 
 // UpdateWalletBalance updates the balance of a wallet by applying a delta.
 func (s *BalanceWalletRepo) UpdateWalletBalance(ctx context.Context, walletID int, delta decimal.Decimal) (*model.BalanceWallet, error) {
 	query := `
-        UPDATE balance_wallet
+        UPDATE acc_wallet
         SET amount = amount + $1
         WHERE wallet_id = $2
 		AND amount + $1 >= 0
