@@ -1,9 +1,9 @@
 package repo
 
 import (
-	"accmodeling/model"
 	"context"
 	"fmt"
+	"walletmodeling/model"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
