@@ -1,5 +1,5 @@
-h1:KvUrMXsUZpOcB4bgUmSZljScZiksih73mLm2cTlWTQM=
-00000000000000_initial.sql h1:SDVOxMluB3h70OCy7OD+osXmoViIxltCiCEyYBO+LPw=
-20260103000001_acc_model.sql h1:nDYKniYvH++aNZhJtRXZ25kArgptXDMhNVnwPrT6UPU=
-20260103000002_utxo_model.sql h1:SEtk39XQOClyknrka2lbNboQ7r8H1omJcfNYgqgNAqc=
-20260103000003_init_data.sql h1:jZ1ebLbJu+5KqpOWYLpQZRmB2+9/8nfOq0RnfdqDpiI=
+h1:knSJpONCnSm+5vTBq/B+Ecq721cVuuOWETtf5ZjVHaA=
+20261108121012_currency.sql h1:4aA6a8Elfz+/j/YHarY4ztzuX8Hrz+qGSS/yh5NlxW8=
+20261108121013_account_model.sql h1:RpwqMwaC3DW+xn50ZgmeigZn7aa7OIqWum2dmEbKsDI=
+20261108121014_utxo_model.sql h1:3nihpcYHMvYOO9OZa+8U0r1rHj3Ktz2D8DY8sMiPbR4=
+20261108121017_seed_currency.sql h1:7D8WmgXrT5V725CVQEDCkbR8R0Di3RxpjjSNGzxm3UA=

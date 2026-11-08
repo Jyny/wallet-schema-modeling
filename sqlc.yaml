@@ -8,10 +8,8 @@ sql:
         package: "db"
         out: "repo/db"
         sql_package: "pgx/v5"
-        emit_json_tags: true
-        emit_db_tags: true
         overrides:
-          - db_type: "numeric"
+          - db_type: "pg_catalog.numeric"
             go_type:
               import: "github.com/shopspring/decimal"
               type: "Decimal"
@@ -19,3 +17,8 @@ sql:
             go_type:
               import: "github.com/google/uuid"
               type: "UUID"
+          - db_type: "uuid"
+            nullable: true
+            go_type:
+              import: "github.com/google/uuid"
+              type: "NullUUID"

@@ -1,101 +1,265 @@
-# https://github.com/Jyny/atlas-lab/releases/tag/0.1.0
+# https://github.com/Jyny/atlas-lab/releases/tag/0.4.0 (postgres only)
 
+# local, git-ignored settings (`make env.init` creates it from .env.example).
+# exported so docker compose and atlas.hcl read the same values as make.
+ENV_KEYS = DB_USER DB_PASSWORD DB_NAME STAGING_URL
+
+# precedence: command line > environment > .env > defaults, same as docker
+# compose. assignments in an included file beat the environment in make, so
+# `STAGING_URL=... make ...` would otherwise be clobbered by `STAGING_URL=` in
+# .env: save the environment's values and restore them after the include.
+ENV_FROM_ENV := $(foreach k,$(ENV_KEYS),$(if $(filter environment,$(origin $(k))),$(k)))
+$(foreach k,$(ENV_FROM_ENV),$(eval ENV_SAVED.$(k) := $$(value $(k))))
+-include .env
+$(foreach k,$(ENV_FROM_ENV),$(eval $(k) := $$(ENV_SAVED.$(k))))
+
+# defaults, must match atlas.hcl and docker-compose.yaml
+DB_USER ?= user
+DB_PASSWORD ?= passwd
+DB_NAME ?= default
+export $(ENV_KEYS)
+
+# local database for the go tests and the seeder
+DATABASE_URL ?= postgres://$(DB_USER):$(DB_PASSWORD)@localhost:5432/$(DB_NAME)?sslmode=disable
+export DATABASE_URL
+
+# a bare `make` would otherwise run the first target (infra.up) and silently
+# start docker
+.DEFAULT_GOAL := help
+
+# targets that take a positional argument, e.g. `make migrate.new add_users`
+ARG_TARGETS = migrate.diff migrate.new migrate.baseline
+
+# only harvest arguments when one of those is invoked, otherwise `make a b`
+# would declare real target `b` a no-op and make would warn about the clash
+ifneq ($(filter $(ARG_TARGETS),$(firstword $(MAKECMDGOALS))),)
 # arguments (all words after the target)
 ARGS ?= $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
 # avoid args being treated as unknown make targets
 $(foreach arg,$(ARGS),$(eval $(arg):;@:))
+endif
+
+# show this list
+# each target is documented by the first line of the comment block above it,
+# so the listing stays in sync without a hand-kept table
+.PHONY: help
+help:
+	@echo "usage: make <target> [VAR=value]"
+	@echo
+	@awk '\
+	/^#/        { if (doc == "") doc = substr($$0, 3); next } \
+	/^\.PHONY:/ { name = $$2; next } \
+	/^[a-zA-Z0-9._-]+:/ { \
+		if (name != "") printf "  %-16s %s\n", name, doc; \
+		name = ""; doc = ""; next } \
+	            { name = ""; doc = "" } \
+	' $(MAKEFILE_LIST)
+	@echo
+	@echo "  migrate.diff / migrate.new take a name: make migrate.new add_users"
+	@echo "  migrate.baseline takes an optional version: make migrate.baseline 20260101120000"
+	@echo
+	@echo "variables (shown with their current value):"
+	@printf "  %-30s %s\n" \
+		"ATLAS_ENV=$(ATLAS_ENV)" "env for migrate.plan/apply/status/baseline" \
+		"ATLAS_APPROVE=$(ATLAS_APPROVE)" "set empty to restore the confirmation prompt" \
+		"ATLAS_LINT_LATEST=$(ATLAS_LINT_LATEST)" "number of recent migrations to lint" \
+		"ATLAS_LINT_BASE=$(ATLAS_LINT_BASE)" "git base to lint against instead (CI)" \
+		"DC=$(DC)" "docker compose cli" \
+		"ATLAS=$(ATLAS)" "atlas cli" \
+		"SQLC=$(SQLC)" "sqlc cli" \
+		"DATABASE_URL=$(DATABASE_URL)" "database for go tests and seeding"
 
 
 # docker cli
 DC ?= docker-compose
 
+# env
+
+# create .env from .env.example (never overwrites an existing .env)
+.PHONY: env.init
+env.init:
+	@test -e .env && echo ".env already exists" || { cp .env.example .env && echo "created .env"; }
+
 # infra
+
+# start the database in the background
 .PHONY: infra.up
 infra.up:
 	$(DC) up -d
 
+# stop the database, keeping its volume (data survives)
 .PHONY: infra.down
 infra.down:
 	$(DC) down
 
+# stop and start the database (data survives)
+# sequential sub-makes, not prerequisites: under `make -j` prerequisites run in
+# parallel and `up` races `down`, leaving the database stopped
 .PHONY: infra.restart
-infra.restart: infra.down infra.up
+infra.restart:
+	@$(MAKE) --no-print-directory infra.down
+	@$(MAKE) --no-print-directory infra.up
+
+# stop the database AND delete its volume (data is lost)
+.PHONY: infra.reset
+infra.reset:
+	$(DC) down -v
 
 
 # atlas cli
+# command convention: atlas <group> <subcommand> --env <env> [flags] [args]
 ATLAS ?= atlas
 
 # atlas variables (must match atlas.hcl)
-ATLAS_ENV  ?= local
-ATLAS_ENV_LOCAL  ?= local
+ATLAS_ENV ?= local
+ATLAS_ENV_LOCAL = local
 ATLAS_ENV_SCHEMA = schema
 ATLAS_ENV_MIGRATE = migrate
 ATLAS_SCHEMA_SQL = schema/schema.sql
+ATLAS_SCHEMA_URL = file://$(ATLAS_SCHEMA_SQL)
+ATLAS_MIGRATION_DIR = migration
+ATLAS_MIGRATION_URL = file://$(ATLAS_MIGRATION_DIR)
 ATLAS_SCHEMA_TMP = $(ATLAS_SCHEMA_SQL).tmp
 
-# format schema.sql from inspec itself (to normalize formatting)
-.PHONY:	schema.format
+# `schema apply` / `schema clean` prompt for confirmation, which fails outside a
+# TTY. set ATLAS_APPROVE= to restore the interactive prompt.
+ATLAS_APPROVE ?= --auto-approve
+
+# `migrate lint` scope: the latest N files by default, or every file added since
+# ATLAS_LINT_BASE when set (e.g. `make migrate.lint ATLAS_LINT_BASE=main` in CI)
+ATLAS_LINT_LATEST ?= 1
+ATLAS_LINT_BASE ?=
+
+# overwrite schema.sql with `schema inspect` output from env $(1), leaving the
+# existing file untouched if atlas fails. `exit 1` keeps the failure visible:
+# a bare `rm -f` always succeeds and would make the target report success.
+define atlas.inspect.to.schema
+$(ATLAS) schema inspect --env $(1) > $(ATLAS_SCHEMA_TMP) \
+&& mv $(ATLAS_SCHEMA_TMP) $(ATLAS_SCHEMA_SQL) \
+|| { rm -f $(ATLAS_SCHEMA_TMP); exit 1; }
+endef
+
+# require a name argument, e.g. `make migrate.new add_users`
+define require.args
+@test -n "$(strip $(ARGS))" || { echo "usage: make $@ <migration_name>"; exit 1; }
+endef
+
+# fail early when the staging env has no url. atlas would otherwise report
+# `missing driver` or `required flag "url" not set` depending on the command
+define require.url
+@test "$(ATLAS_ENV)" != staging || test -n "$(STAGING_URL)" \
+|| { echo "STAGING_URL is not set: add it to .env or pass STAGING_URL=..."; exit 1; }
+endef
+
+# format atlas.hcl itself
+.PHONY: atlas.fmt
+atlas.fmt:
+	$(ATLAS) schema fmt atlas.hcl
+
+# format schema.sql from inspect itself (to normalize formatting)
+.PHONY: schema.format
 schema.format:
-	$(ATLAS) schema --env $(ATLAS_ENV_SCHEMA) inspect > $(ATLAS_SCHEMA_TMP) \
-	&& mv $(ATLAS_SCHEMA_TMP) $(ATLAS_SCHEMA_SQL) || rm -f $(ATLAS_SCHEMA_TMP)
+	$(call atlas.inspect.to.schema,$(ATLAS_ENV_SCHEMA))
 
 # update schema.sql from migrations (replay migrations to get desired schema)
 .PHONY: schema.update
 schema.update:
-	$(ATLAS) schema --env $(ATLAS_ENV_MIGRATE) inspect > $(ATLAS_SCHEMA_TMP) \
-	&& mv $(ATLAS_SCHEMA_TMP) $(ATLAS_SCHEMA_SQL) || rm -f $(ATLAS_SCHEMA_TMP)
+	$(call atlas.inspect.to.schema,$(ATLAS_ENV_MIGRATE))
+
+# show drift between migrations and schema.sql (no database needed)
+.PHONY: schema.diff
+schema.diff:
+	$(ATLAS) schema diff --env $(ATLAS_ENV_LOCAL) \
+	--from "$(ATLAS_MIGRATION_URL)" --to "$(ATLAS_SCHEMA_URL)"
+
+# preview the plan for schema.apply without touching the database
+.PHONY: schema.plan
+schema.plan:
+	$(ATLAS) schema apply --env $(ATLAS_ENV_LOCAL) --dry-run
 
 # apply declarative schema.sql to local database ONLY
 .PHONY: schema.apply
 schema.apply:
-	$(ATLAS) schema --env $(ATLAS_ENV_LOCAL) apply
+	$(ATLAS) schema apply --env $(ATLAS_ENV_LOCAL) $(ATLAS_APPROVE)
 
 # clean all objects in local database ONLY
+# only drops the schema the url points at ("public"), so the revisions
+# in the "atlas" schema survive and `migrate.status` still counts those files
+# as executed against what is now an empty database. use infra.reset for a
+# true zero state.
 .PHONY: schema.clean
 schema.clean:
-	$(ATLAS) schema --env $(ATLAS_ENV_LOCAL) clean
+	$(ATLAS) schema clean --env $(ATLAS_ENV_LOCAL) $(ATLAS_APPROVE)
 
-# gen diff diff from migrations to schema
-.PHONY:	migrate.diff
+# gen migration file from migrations to schema
+.PHONY: migrate.diff
 migrate.diff:
-	$(ATLAS) migrate --env $(ATLAS_ENV_LOCAL) diff $(ARGS)
+	$(require.args)
+	$(ATLAS) migrate diff --env $(ATLAS_ENV_LOCAL) $(ARGS)
 
 # create new migration file
 .PHONY: migrate.new
 migrate.new:
-	$(ATLAS) migrate --env $(ATLAS_ENV_LOCAL) new $(ARGS)
+	$(require.args)
+	$(ATLAS) migrate new --env $(ATLAS_ENV_LOCAL) $(ARGS)
 
-# lint migration files
+# lint migration files (scope is set by ATLAS_LINT_LATEST / ATLAS_LINT_BASE)
 .PHONY: migrate.lint
 migrate.lint:
-	$(ATLAS) migrate --env $(ATLAS_ENV_LOCAL) lint --git-base main
+	$(ATLAS) migrate lint --env $(ATLAS_ENV_LOCAL) \
+	$(if $(ATLAS_LINT_BASE),--git-base $(ATLAS_LINT_BASE),--latest $(ATLAS_LINT_LATEST))
 
 # validate migration files
 .PHONY: migrate.validate
 migrate.validate:
-	$(ATLAS) migrate --env $(ATLAS_ENV_LOCAL) validate
+	$(ATLAS) migrate validate --env $(ATLAS_ENV_LOCAL)
 
 # hash migration files
 .PHONY: migrate.hash
 migrate.hash:
-	$(ATLAS) migrate --env $(ATLAS_ENV_LOCAL) hash
+	$(ATLAS) migrate hash --env $(ATLAS_ENV_LOCAL)
+
+# preview pending migrations without applying them (default: local)
+.PHONY: migrate.plan
+migrate.plan:
+	$(require.url)
+	$(ATLAS) migrate apply --env $(ATLAS_ENV) --dry-run
 
 # apply migrations to target database (default: local)
 .PHONY: migrate.apply
 migrate.apply:
-	$(ATLAS) migrate --env $(ATLAS_ENV) apply
+	$(require.url)
+	$(ATLAS) migrate apply --env $(ATLAS_ENV)
 
 # show migration status for target database (default: local)
 .PHONY: migrate.status
 migrate.status:
-	$(ATLAS) migrate --env $(ATLAS_ENV) status
+	$(require.url)
+	$(ATLAS) migrate status --env $(ATLAS_ENV)
+
+# baseline a database built by `schema.apply`, then apply the rest (default: local)
+# `migrate apply` refuses a non-empty database that has no revisions. this
+# records the given version (and everything before it) as applied WITHOUT
+# running it, then runs every file after it. pass a version to baseline at, or
+# omit to baseline at the latest file. there is no safe preview: in atlas
+# community v1.3.0 `--baseline --dry-run` still writes the baseline revision.
+# a database that already has revisions ignores --baseline.
+.PHONY: migrate.baseline
+migrate.baseline:
+	$(require.url)
+	@v="$(strip $(ARGS))"; \
+	test -n "$$v" || v=$$(ls $(ATLAS_MIGRATION_DIR)/*.sql 2>/dev/null | sort | tail -1 \
+		| sed 's|.*/||; s/_.*//; s/\.sql$$//'); \
+	test -n "$$v" || { echo "no migration files in $(ATLAS_MIGRATION_DIR)/ to baseline at"; exit 1; }; \
+	echo "$(ATLAS) migrate apply --env $(ATLAS_ENV) --baseline $$v"; \
+	$(ATLAS) migrate apply --env $(ATLAS_ENV) --baseline "$$v"
 
 
 # sqlc cli (via docker)
 SQLC_VERSION ?= 1.30.0
-SQLC ?= docker run --rm -v $(CURDIR):/src -w /src sqlc/sqlc:$(SQLC_VERSION)
+SQLC ?= docker run --rm -v $(CURDIR):/src -w /src docker.io/sqlc/sqlc:$(SQLC_VERSION)
 
-# generate go code from sql queries
+# generate go code from query/*.sql against schema/schema.sql
 .PHONY: sqlc.generate
 sqlc.generate:
 	$(SQLC) generate
@@ -105,11 +269,40 @@ sqlc.generate:
 sqlc.compile:
 	$(SQLC) compile
 
+# check generated go code is up to date
 .PHONY: sqlc.diff
 sqlc.diff:
 	$(SQLC) diff
 
-# vet sql queries
-.PHONY: sqlc.vet
-sqlc.vet:
-	$(SQLC) vet
+
+# go
+
+# run unit tests (repo tests need a migrated database: infra.up, migrate.apply)
+.PHONY: go.test
+go.test:
+	TEST_REQUIRE_DB=1 go test -count=1 ./...
+
+# runs per benchmark, for benchstat
+BENCH_COUNT ?= 5
+
+# benchmark the same workloads against both models (needs a migrated database)
+# the fragmented debit re-credits its inputs every op, so it runs a fixed count
+.PHONY: go.bench
+go.bench:
+	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s \
+	-bench 'GetBalance|ListBalances|Credit|^BenchmarkDebit$$|HoldRelease|Parallel' ./repo
+	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 150x \
+	-bench 'DebitFragmented' ./repo
+
+# seed demo wallets 1..3 into both models through the repos (replaces them)
+.PHONY: db.seed
+db.seed:
+	go run ./cmd/seed
+
+# zero to seeded: start the database, apply migrations, seed
+.PHONY: db.init
+db.init:
+	@$(MAKE) --no-print-directory infra.up
+	@until $(DC) exec -T postgres pg_isready -q -U $(DB_USER) -d $(DB_NAME); do sleep 1; done
+	@$(MAKE) --no-print-directory migrate.apply
+	@$(MAKE) --no-print-directory db.seed

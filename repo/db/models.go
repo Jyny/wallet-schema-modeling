@@ -7,19 +7,63 @@ package db
 import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/shopspring/decimal"
 )
 
-type AccWallet struct {
-	WalletID  int32            `db:"wallet_id" json:"wallet_id"`
-	Amount    pgtype.Numeric   `db:"amount" json:"amount"`
-	CreatedAt pgtype.Timestamp `db:"created_at" json:"created_at"`
-	UpdatedAt pgtype.Timestamp `db:"updated_at" json:"updated_at"`
+type Account struct {
+	WalletID  int64
+	Currency  string
+	Available decimal.Decimal
+	Held      decimal.Decimal
+	CreatedAt pgtype.Timestamptz
+	UpdatedAt pgtype.Timestamptz
 }
 
-type UtxoWallet struct {
-	TxID      uuid.UUID        `db:"tx_id" json:"tx_id"`
-	WalletID  int32            `db:"wallet_id" json:"wallet_id"`
-	Amount    pgtype.Numeric   `db:"amount" json:"amount"`
-	CreatedAt pgtype.Timestamp `db:"created_at" json:"created_at"`
-	SpentAt   pgtype.Timestamp `db:"spent_at" json:"spent_at"`
+type AccountEntry struct {
+	EntryID        uuid.UUID
+	WalletID       int64
+	Currency       string
+	Kind           string
+	AvailableDelta decimal.Decimal
+	HeldDelta      decimal.Decimal
+	HoldID         uuid.NullUUID
+	CreatedAt      pgtype.Timestamptz
+}
+
+type AccountHold struct {
+	HoldID    uuid.UUID
+	WalletID  int64
+	Currency  string
+	Amount    decimal.Decimal
+	Status    string
+	CreatedAt pgtype.Timestamptz
+	UpdatedAt pgtype.Timestamptz
+}
+
+type Currency struct {
+	Code      string
+	Scale     int16
+	CreatedAt pgtype.Timestamptz
+}
+
+type Utxo struct {
+	UtxoID    uuid.UUID
+	WalletID  int64
+	Currency  string
+	Amount    decimal.Decimal
+	HoldID    uuid.NullUUID
+	CreatedTx uuid.UUID
+	SpentTx   uuid.NullUUID
+	CreatedAt pgtype.Timestamptz
+	SpentAt   pgtype.Timestamptz
+}
+
+type UtxoTx struct {
+	TxID      uuid.UUID
+	WalletID  int64
+	Currency  string
+	Kind      string
+	Amount    decimal.Decimal
+	HoldID    uuid.NullUUID
+	CreatedAt pgtype.Timestamptz
 }

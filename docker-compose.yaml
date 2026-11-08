@@ -1,11 +1,19 @@
+# values come from .env, falling back to the same defaults as atlas.hcl
 services:
-  db:
+  postgres:
     image: postgres:18
     container_name: postgres
     restart: always
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: passwd
-      POSTGRES_DB: default
+      POSTGRES_USER: ${DB_USER:-user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-passwd}
+      POSTGRES_DB: ${DB_NAME:-default}
     ports:
       - "5432:5432"
+    volumes:
+      # postgres:18 puts PGDATA under /var/lib/postgresql/18/docker and declares
+      # /var/lib/postgresql as the volume, so mount the parent, not PGDATA
+      - pgdata:/var/lib/postgresql
+
+volumes:
+  pgdata:
