@@ -290,9 +290,16 @@ BENCH_COUNT ?= 5
 .PHONY: go.bench
 go.bench:
 	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s \
-	-bench 'GetBalance|ListBalances|Credit|^BenchmarkDebit$$|HoldRelease|Parallel' ./repo
+	-bench 'GetBalance|ListBalances|^BenchmarkCredit$$|^BenchmarkDebit$$|HoldRelease|Parallel' ./repo
 	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 150x \
 	-bench 'DebitFragmented' ./repo
+
+# hot account sweeps: one account under parallel load, varying round-trip
+# latency, workers, outputs and a competing lock (several minutes)
+.PHONY: go.bench.hot
+go.bench.hot:
+	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s -timeout 60m \
+	-bench 'HotAccount' ./repo
 
 # seed demo wallets 1..3 into both models through the repos (replaces them)
 .PHONY: db.seed

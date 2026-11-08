@@ -115,7 +115,7 @@ unspent outputs, served index-only by
 | read balance            | single PK lookup                                      | aggregate over unspent outputs (grows with fragmentation)       |
 | write                   | 1 UPDATE (+ hold / entry insert)                      | select inputs, spend N, insert 1-2 outputs                      |
 | non-negative guarantee  | `CHECK (available >= 0)` + guarded UPDATE             | outputs are positive; spends only what was selected and locked  |
-| concurrency, same wallet+currency | serialized on one row lock (hot row)        | parallel on disjoint outputs via `SKIP LOCKED`                  |
+| concurrency, same wallet+currency | serialized on one row lock (hot row), held ~3 round trips per write | parallel on disjoint outputs via `SKIP LOCKED`                  |
 | contention failure mode | waits on the row lock                                 | skips locked outputs; when that leaves it short, backs off and retries |
 | a long tx holding a lock | blocks every write of that account until it ends    | spends around the locked output; `ErrContended` only if it is needed |
 | history / audit         | needs separate entries, kept in sync by the app       | intrinsic: every output records the tx that created and spent it |
@@ -125,8 +125,10 @@ unspent outputs, served index-only by
 | balance bound (< 1e20)  | exact, enforced by the column type under the row lock | per transaction: concurrent credits can exceed it (reads stay correct) |
 
 Rule of thumb: A is simpler and reads are O(1); pick it unless a single
-wallet's balance is a write hotspot. B trades read cost and storage for
-lock-free parallel spends and a self-auditing history.
+wallet's balance is a write hotspot, the more so when the database is a
+network hop away (see [Where UTXO is faster](#where-utxo-is-faster)). B trades
+read cost and storage for lock-free parallel spends and a self-auditing
+history.
 
 Not modeled: consolidating small outputs (B), partial settle, transfers
 between wallets, a `wallet` table (wallet ids are external references).
@@ -162,8 +164,124 @@ goroutines sharing a 10-connection pool:
   outputs, parallel debits of one account match distinct accounts and beat the
   account model. With a single output they chain through each other's change
   and back off, which is its worst case.
+- Locally a round trip is ~0.1ms, which hides most of the hot-row cost; see
+  below for the same workload with network latency.
 - `Credit` accumulates outputs on one wallet over the run, so its UTXO time
   includes a growing balance read (hence the higher variance).
+
+## Where UTXO is faster
+
+One hot account under concurrent writes. The account model locks the row at
+its `UPDATE` and keeps it until `COMMIT` returns, across the `account_entry`
+INSERT and the COMMIT round trips, so writes of one account queue up however
+many connections the app has. UTXO writes hold their locks as long, but on
+disjoint outputs (or none: a credit only inserts), so they overlap.
+
+`make go.bench.hot` (`BenchmarkHotAccount*` in `repo/bench_test.go`) sweeps
+one dimension at a time around a baseline of **1ms per round trip** (about a
+cross-zone hop, injected by delaying every write on the connection), **16
+workers** each with its own connection, and a wallet funded by **64 outputs**.
+Scenarios:
+
+| benchmark               | workload                                         | why the account model serializes                 |
+| ----------------------- | ------------------------------------------------ | ------------------------------------------------ |
+| `HotAccountDebit`       | debits                                           | every debit updates the row                      |
+| `HotAccountCredit`      | credits to an empty wallet (incoming payments)   | every credit updates the row; UTXO takes no lock |
+| `HotAccountHoldSettle`  | hold then settle (authorize, capture)            | two row updates per op; UTXO settle locks only its output |
+| `HotAccountDebitSlowTx` | debits while another session locks the funds, on and off | waits for the row; UTXO spends around the locked output |
+
+Medians of 3 runs, Apple M4, PostgreSQL 18 in a local container, 2026-11-09;
+wall time per op across all workers, lower is better. No run hit
+`ErrContended`.
+
+**Round-trip latency** (16 workers, 64 outputs):
+
+| rtt   | debit account | debit utxo | ratio | credit account | credit utxo | ratio | hold+settle account | hold+settle utxo | ratio |
+| ----- | ------: | ------: | ----: | ------: | ------: | ----: | -------: | ------: | ----: |
+| 0     | 670µs   | 430µs   | 0.64x | 1.70ms  | 482µs   | 0.28x | 3.64ms   | 930µs   | 0.26x |
+| 0.5ms | 1.84ms  | 539µs   | 0.29x | 1.86ms  | 495µs   | 0.27x | 4.69ms   | 1.06ms  | 0.23x |
+| 1ms   | 3.11ms  | 695µs   | 0.22x | 3.06ms  | 554µs   | 0.18x | 8.02ms   | 1.37ms  | 0.17x |
+| 2ms   | 5.51ms  | 1.23ms  | 0.22x | 5.32ms  | 1.01ms  | 0.19x | 13.54ms  | 2.44ms  | 0.18x |
+
+**Workers** (1ms rtt, 64 outputs):
+
+| workers | debit account | debit utxo | ratio | credit account | credit utxo | ratio | hold+settle account | hold+settle utxo | ratio |
+| ------: | ------: | ------: | ----: | ------: | ------: | ----: | -------: | ------: | ----: |
+| 1       | 7.73ms  | 12.28ms | 1.59x | 7.68ms  | 8.62ms  | 1.12x | 19.46ms  | 22.23ms | 1.14x |
+| 4       | 3.05ms  | 2.95ms  | 0.97x | 2.96ms  | 2.12ms  | 0.72x | 7.54ms   | 5.73ms  | 0.76x |
+| 16      | 3.11ms  | 695µs   | 0.22x | 3.06ms  | 554µs   | 0.18x | 8.02ms   | 1.37ms  | 0.17x |
+| 64      | 3.36ms  | 382µs   | 0.11x | 3.42ms  | 414µs   | 0.12x | 10.58ms  | 1.36ms  | 0.13x |
+
+**Outputs** the wallet starts from (debit, 1ms rtt, 16 workers):
+
+| outputs | account | utxo    | ratio |
+| ------: | ------: | ------: | ----: |
+| 1       | 3.53ms  | 6.36ms  | 1.80x |
+| 4       | 3.52ms  | 1.68ms  | 0.48x |
+| 16      | 3.18ms  | 692µs   | 0.22x |
+| 64      | 3.11ms  | 695µs   | 0.22x |
+| 256     | 2.95ms  | 797µs   | 0.27x |
+
+**A competing lock** held for `lock`, then released for as long (debit, 16
+workers, 64 outputs):
+
+| rtt | lock | account | utxo   | ratio |
+| --: | ---: | ------: | -----: | ----: |
+| 0   | 5ms  | 1.35ms  | 753µs  | 0.56x |
+| 1ms | 1ms  | 3.37ms  | 925µs  | 0.27x |
+| 1ms | 5ms  | 3.69ms  | 1.02ms | 0.28x |
+| 1ms | 20ms | 5.13ms  | 923µs  | 0.18x |
+
+### How much faster under high concurrency
+
+Throughput X(N) = 1 / (time per op) over the workers sweep, fitted to two
+models:
+
+- **Amdahl's law**: speedup(N) = 1 / (σ + (1 - σ) / N), σ being the serial
+  fraction of an op. Solved from the measured speedup at N = 64; the ceiling
+  is 1/σ.
+- **Universal Scalability Law** (Gunther): X(N) = λN / (1 + σ(N - 1) +
+  κN(N - 1)). σ is contention (queueing on a shared lock), κ coherency (costs
+  growing with every pair of workers: lock skipping, WAL and CPU on one
+  server). Peak throughput at N* = √((1 - σ) / κ).
+
+| benchmark   | model   | T(1)    | X(1)  | X(64)  | speedup at 64 | Amdahl σ | ceiling 1/σ | USL σ | USL κ   | USL peak X | N*  |
+| ----------- | ------- | ------: | ----: | -----: | ------------: | -------: | ----------: | ----: | ------: | ---------: | --: |
+| debit       | account | 7.73ms  | 129/s | 297/s  | 2.3x          | 0.43     | 2.3x        | 0.37  | 0.0025  | 348/s      | 16  |
+| debit       | utxo    | 12.28ms | 81/s  | 2617/s | 32x           | 0.016    | 61x         | 0     | 0.00034 | 2651/s     | 55  |
+| credit      | account | 7.68ms  | 130/s | 293/s  | 2.2x          | 0.44     | 2.3x        | 0.36  | 0.0029  | 355/s      | 15  |
+| credit      | utxo    | 8.62ms  | 116/s | 2413/s | 21x           | 0.033    | 30x         | 0     | 0.00059 | 2659/s     | 41  |
+| hold+settle | account | 19.46ms | 51/s  | 95/s   | 1.8x          | 0.54     | 1.9x        | 0.33  | 0.0054  | 138/s      | 11  |
+| hold+settle | utxo    | 22.23ms | 45/s  | 734/s  | 16x           | 0.046    | 22x         | 0     | 0.00092 | 909/s      | 33  |
+
+Reading it:
+
+- **The account model is an Amdahl ceiling of ~2.3x.** About 43% of a debit
+  is spent holding the row lock, so one account tops out near 300-350 ops/s
+  at 1ms rtt whatever the pool size; past N* ≈ 16 more workers only make it
+  slower (3.11ms → 3.36ms per op at 64). Hold+settle updates the row twice and
+  caps lower, at ~1.9x.
+- **The serial part is round trips.** Over the rtt sweep the account model's
+  time per debit at 16 workers fits S ≈ 0.66ms + 2.4 x rtt: the lock spans
+  2-3 round trips plus the commit. Its peak throughput is about
+  1 / (0.66ms + 2.4 x rtt): ~1500 ops/s locally, ~300/s at 1ms, ~180/s at 2ms.
+- **The UTXO model has no measurable σ.** It scales with workers until the
+  database server itself saturates (κ), peaking at ~2650 debits/s at N ≈ 55
+  on this machine: **~7.6x the account model's peak** for debits and credits,
+  ~6.6x for hold+settle. Its time per op is ≈ T(1) / N, so against the
+  account model's flat S the ratio is ≈ T_utxo(1) / (N x S_account): 1.6x
+  slower at N = 1, break-even at N ≈ 4, ~0.2x at 16, ~0.1x at 64.
+- **It needs outputs to spread over.** With 1 output concurrent debits chain
+  through each other's change (1.8x slower); 4 outputs already halve the
+  account model's time, ~16 (≈ workers) reach the full gain. Beyond that more
+  outputs only add balance-read cost (256: 0.27x).
+- **A competing long lock** makes the account model worse the longer it is
+  held (3.37ms → 5.13ms per debit from 1ms to 20ms), while the UTXO model is
+  unaffected (~0.92ms).
+
+`TestHotAccountUnderLatency` (`repo/latency_test.go`) asserts the baseline
+case: 16 workers x 10 debits at 1ms rtt must finish sooner on the UTXO model
+(0.16x-0.28x across runs).
 
 ## Tests
 
@@ -184,6 +302,9 @@ they run against a seeded database and repeat cleanly.
   per currency, spending exactly everything, hundreds of dust outputs, exact
   decimal arithmetic, malformed currency codes, amount spellings, hold ids
   across models, release overflowing available, wallets holding only held funds
+- `latency_test.go`: concurrent debits of one hot account with 1ms injected
+  per round trip; the UTXO model must finish first (see
+  [Where UTXO is faster](#where-utxo-is-faster)). Skipped under `-short`
 - `contract_test.go`: the same behaviour suite run against both repos,
   including concurrent debits, debits and holds contending for a single output,
   and racing release/settle of one hold
