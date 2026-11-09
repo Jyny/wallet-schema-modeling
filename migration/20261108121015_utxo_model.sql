@@ -35,5 +35,9 @@ CREATE TABLE "utxo" (
 );
 -- Create index "utxo_available_idx" to table: "utxo"
 CREATE INDEX "utxo_available_idx" ON "utxo" ("wallet_id", "currency", "utxo_id") WHERE ((spent_at IS NULL) AND (hold_id IS NULL));
+-- Create index "utxo_created_tx_idx" to table: "utxo"
+CREATE INDEX "utxo_created_tx_idx" ON "utxo" ("created_tx");
+-- Create index "utxo_spent_tx_idx" to table: "utxo"
+CREATE INDEX "utxo_spent_tx_idx" ON "utxo" ("spent_tx") WHERE (spent_tx IS NOT NULL);
 -- Create index "utxo_unspent_idx" to table: "utxo"
 CREATE INDEX "utxo_unspent_idx" ON "utxo" ("wallet_id", "currency") INCLUDE ("amount", "hold_id") WHERE (spent_at IS NULL);

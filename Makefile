@@ -19,10 +19,6 @@ DB_PASSWORD ?= passwd
 DB_NAME ?= default
 export $(ENV_KEYS)
 
-# local database for the go tests and the seeder
-DATABASE_URL ?= postgres://$(DB_USER):$(DB_PASSWORD)@localhost:5432/$(DB_NAME)?sslmode=disable
-export DATABASE_URL
-
 # a bare `make` would otherwise run the first target (infra.up) and silently
 # start docker
 .DEFAULT_GOAL := help
@@ -66,8 +62,7 @@ help:
 		"ATLAS_LINT_BASE=$(ATLAS_LINT_BASE)" "git base to lint against instead (CI)" \
 		"DC=$(DC)" "docker compose cli" \
 		"ATLAS=$(ATLAS)" "atlas cli" \
-		"SQLC=$(SQLC)" "sqlc cli" \
-		"DATABASE_URL=$(DATABASE_URL)" "database for go tests and seeding"
+		"SQLC=$(SQLC)" "sqlc cli"
 
 
 # docker cli
@@ -275,41 +270,11 @@ sqlc.diff:
 	$(SQLC) diff
 
 
-# go
+# db
 
-# run unit tests (repo tests need a migrated database: infra.up, migrate.apply)
-.PHONY: go.test
-go.test:
-	TEST_REQUIRE_DB=1 go test -count=1 ./...
-
-# runs per benchmark, for benchstat
-BENCH_COUNT ?= 5
-
-# benchmark the same workloads against both models (needs a migrated database)
-# the fragmented debit re-credits its inputs every op, so it runs a fixed count
-.PHONY: go.bench
-go.bench:
-	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s \
-	-bench 'GetBalance|ListBalances|^BenchmarkCredit$$|^BenchmarkDebit$$|HoldRelease|Parallel' ./repo
-	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 150x \
-	-bench 'DebitFragmented' ./repo
-
-# hot account sweeps: one account under parallel load, varying round-trip
-# latency, workers, outputs and a competing lock (several minutes)
-.PHONY: go.bench.hot
-go.bench.hot:
-	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s -timeout 60m \
-	-bench 'HotAccount' ./repo
-
-# seed demo wallets 1..3 into both models through the repos (replaces them)
-.PHONY: db.seed
-db.seed:
-	go run ./cmd/seed
-
-# zero to seeded: start the database, apply migrations, seed
+# zero to migrated: start the database, wait for it, apply migrations
 .PHONY: db.init
 db.init:
 	@$(MAKE) --no-print-directory infra.up
 	@until $(DC) exec -T postgres pg_isready -q -U $(DB_USER) -d $(DB_NAME); do sleep 1; done
 	@$(MAKE) --no-print-directory migrate.apply
-	@$(MAKE) --no-print-directory db.seed
