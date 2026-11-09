@@ -261,6 +261,49 @@ workers, 64 outputs):
 | 1ms | 5ms  | 4.10ms  | 664µs  | 0.16x |
 | 1ms | 20ms | 4.71ms  | 664µs  | 0.14x |
 
+### Lock wait or latency
+
+`runHot` also splits the time of one op, as its worker sees it (`op-ms`,
+about ns/op x workers), into `rtt-ms`, the latency injected into its own round
+trips, `db-ms`, the rest of its statements' time (BEGIN and COMMIT included),
+spent in the database, and `app-ms`, outside any statement: the UTXO model's
+backoff between retries. What `db-ms` adds over its value at 1 worker is
+waiting. Debit, 1ms rtt, 64 outputs, one run, ms per op:
+
+| workers | account op | own rtt | db  | of which waiting | utxo op | own rtt | db   | of which waiting |
+| ------: | ---------: | ------: | ---: | ---------------: | ------: | ------: | ---: | ---------------: |
+| 1       | 7.5        | 5.7     | 1.8  | -                | 11.8    | 9.1     | 2.7  | -                |
+| 4       | 11.9       | 5.4     | 6.5  | 4.7 (40%)        | 11.9    | 8.7     | 3.2  | 0.4 (4%)         |
+| 16      | 49.8       | 5.5     | 44.4 | 42.6 (86%)       | 11.1    | 8.2     | 2.9  | 0.1 (1%)         |
+| 64      | 208.8      | 5.5     | 203.3 | 201.5 (97%)     | 30.1    | 8.4     | 21.7 | 18.9 (63%)       |
+
+What the waiting is, from `pg_stat_activity` sampled every ~1ms during the
+same workload (backends inside a transaction; `idle in transaction /
+ClientRead` is a backend waiting for its client, i.e. for the latency):
+
+| wait                               | account, 16 | account, 64 | utxo, 16 | utxo, 64 |
+| ---------------------------------- | ----------: | ----------: | -------: | -------: |
+| Lock: transactionid, tuple (row lock) | 85%      | 78%         | 0        | 0        |
+| LWLock: LockManager                | 2.5%        | 19%         | 0        | 0        |
+| idle in transaction: ClientRead    | 11%         | 2.4%        | 84%      | 54%      |
+| LWLock: WALWrite, BufferContent    | 0           | 0           | 2%       | 29%      |
+| CPU                                | 1%          | 0.5%        | 8%       | 10%      |
+
+- **The account model waits for its row lock.** Its own latency stays at
+  ~5 round trips whatever the workers; what grows is waiting in the database,
+  86% of an op at 16 workers, and Postgres puts it on the row lock. That wait
+  is the other writers' latency: the lock holder sits idle in transaction for
+  its entry INSERT and COMMIT round trips while the queue behind it waits, so
+  a waiter's lock wait is about the queue length x the lock span
+  (~2.9 rtt + execution).
+- **The UTXO model waits for its own latency.** ~8 round trips per op, and no
+  row lock waits at all (`SKIP LOCKED`). At 64 workers its database time grows
+  too, but on WAL and buffer LWLocks and CPU: the server saturating (κ in the
+  USL fit below), not a lock queue.
+- **The exception is a wallet of 1 output**: UTXO debits then spend 46ms per
+  op in backoff (`app-ms`) and 43ms in the round trips of ~5 attempts, waiting
+  for each other's change rather than for a lock.
+
 ### How much faster under high concurrency
 
 Throughput X(N) = 1 / (time per op) over the workers sweep, fitted to two

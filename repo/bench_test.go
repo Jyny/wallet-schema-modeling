@@ -276,14 +276,23 @@ func varyLock(c hotCase) []hotCase {
 // runHot runs op from c.workers goroutines against each model, on a wallet
 // funded with c.outputs outputs. prepare, when set, runs after funding with
 // an undelayed pool and returns a func to undo it. failures with ErrContended
-// are reported, not fatal
+// are reported, not fatal.
+//
+// besides wall time per op across workers (ns/op), it splits the time of one
+// op, as its worker sees it (op-ms), into:
+//   - rtt-ms: the latency injected into its own round trips
+//   - db-ms: the rest of its statements' time, spent in the database executing
+//     and waiting for row locks. what exceeds db-ms at 1 worker is waiting
+//   - app-ms: the rest, outside any statement: the utxo model's backoff
+//     between retries, and client cpu
 func runHot(b *testing.B, cases []hotCase,
 	prepare func(pool *pgxpool.Pool, c hotCase, model string, walletID int64) (stop func()),
 	op func(r WalletRepo, walletID int64) error,
 ) {
 	pool := setupTestDB(b)
 	for _, c := range cases {
-		slow := latencyPool(b, pool.Config(), c.rtt, int32(c.workers))
+		stats := &connStats{}
+		slow := latencyPool(b, pool.Config(), c.rtt, int32(c.workers), stats)
 		repos := []hotRepo{
 			{"account", NewAccountWalletRepo(pool), NewAccountWalletRepo(slow)},
 			{"utxo", NewUTXOWalletRepo(pool), NewUTXOWalletRepo(slow)},
@@ -299,13 +308,16 @@ func runHot(b *testing.B, cases []hotCase,
 				}
 				warm(b, slow, c.workers)
 
-				var next, failed atomic.Int64
+				var next, failed, opTime atomic.Int64
 				var wg sync.WaitGroup
+				stats.reset()
 				b.ResetTimer()
 				for range c.workers {
 					wg.Go(func() {
 						for next.Add(1) <= int64(b.N) {
+							start := time.Now()
 							err := op(r.repo, w)
+							opTime.Add(int64(time.Since(start)))
 							if errors.Is(err, ErrContended) {
 								failed.Add(1)
 								continue
@@ -320,6 +332,12 @@ func runHot(b *testing.B, cases []hotCase,
 				wg.Wait()
 				b.StopTimer()
 				b.ReportMetric(float64(failed.Load())/float64(b.N), "contended/op")
+				perOp := func(ns int64) float64 { return float64(ns) / float64(b.N) / 1e6 }
+				slept, inStmt, total := stats.slept.Load(), stats.inStmt.Load(), opTime.Load()
+				b.ReportMetric(perOp(total), "op-ms")
+				b.ReportMetric(perOp(slept), "rtt-ms")
+				b.ReportMetric(perOp(inStmt-slept), "db-ms")
+				b.ReportMetric(perOp(total-inStmt), "app-ms")
 			})
 		}
 		slow.Close()

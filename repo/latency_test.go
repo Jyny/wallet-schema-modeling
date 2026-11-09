@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"walletmodeling/model"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 	"github.com/stretchr/testify/assert"
@@ -28,34 +30,69 @@ import (
 type slowConn struct {
 	net.Conn
 	latency time.Duration
+	stats   *connStats
 }
 
 func (c *slowConn) Write(b []byte) (int, error) {
+	start := time.Now()
 	time.Sleep(c.latency)
+	if c.stats != nil {
+		c.stats.slept.Add(int64(time.Since(start)))
+	}
 	return c.Conn.Write(b)
+}
+
+// connStats tells where the time of operations on a latencyPool goes, in
+// nanoseconds summed over its connections: slept is the latency injected into
+// round trips, inStmt the time inside statements, BEGIN and COMMIT included,
+// from the call until the result is read. inStmt - slept is the time spent in
+// the database: executing, and waiting for locks
+type connStats struct {
+	slept, inStmt atomic.Int64
+}
+
+func (s *connStats) reset() {
+	s.slept.Store(0)
+	s.inStmt.Store(0)
+}
+
+type stmtStartKey struct{}
+
+func (s *connStats) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
+	return context.WithValue(ctx, stmtStartKey{}, time.Now())
+}
+
+func (s *connStats) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryEndData) {
+	if start, ok := ctx.Value(stmtStartKey{}).(time.Time); ok {
+		s.inStmt.Add(int64(time.Since(start)))
+	}
 }
 
 // setupLatencyDB is setupTestDB with latency added to every round trip and
 // a pool of maxConns connections
 func setupLatencyDB(t testing.TB, latency time.Duration, maxConns int32) *pgxpool.Pool {
 	t.Helper()
-	pool := latencyPool(t, setupTestDB(t).Config(), latency, maxConns)
+	pool := latencyPool(t, setupTestDB(t).Config(), latency, maxConns, nil)
 	t.Cleanup(pool.Close)
 	return pool
 }
 
 // latencyPool opens a pool of maxConns connections from cfg, adding latency
-// to every round trip. the caller closes it
-func latencyPool(t testing.TB, cfg *pgxpool.Config, latency time.Duration, maxConns int32) *pgxpool.Pool {
+// to every round trip and, when stats is not nil, recording where the time
+// goes. the caller closes it
+func latencyPool(t testing.TB, cfg *pgxpool.Config, latency time.Duration, maxConns int32, stats *connStats) *pgxpool.Pool {
 	t.Helper()
 	cfg.MaxConns = maxConns
+	if stats != nil {
+		cfg.ConnConfig.Tracer = stats
+	}
 	if latency > 0 {
 		cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			c, err := new(net.Dialer).DialContext(ctx, network, addr)
 			if err != nil {
 				return nil, err
 			}
-			return &slowConn{Conn: c, latency: latency}, nil
+			return &slowConn{Conn: c, latency: latency, stats: stats}, nil
 		}
 	}
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
