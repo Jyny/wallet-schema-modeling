@@ -95,3 +95,6 @@ CREATE TABLE "utxo" (
 CREATE INDEX "utxo_available_idx" ON "utxo" ("wallet_id", "currency", "utxo_id") WHERE ((spent_at IS NULL) AND (hold_id IS NULL));
 -- balance: index-only sum over unspent outputs
 CREATE INDEX "utxo_unspent_idx" ON "utxo" ("wallet_id", "currency") INCLUDE ("amount", "hold_id") WHERE (spent_at IS NULL);
+-- history: the outputs a tx created and spent
+CREATE INDEX "utxo_created_tx_idx" ON "utxo" ("created_tx");
+CREATE INDEX "utxo_spent_tx_idx" ON "utxo" ("spent_tx") WHERE (spent_tx IS NOT NULL);

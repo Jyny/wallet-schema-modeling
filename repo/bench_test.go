@@ -32,7 +32,7 @@ func benchRepos(b *testing.B) (*pgxpool.Pool, []benchRepo) {
 }
 
 // fundedWallet is a fresh wallet holding outputs credits of amount each
-func fundedWallet(b *testing.B, r WalletRepo, outputs int, amount string) int64 {
+func fundedWallet(b testing.TB, r WalletRepo, outputs int, amount string) int64 {
 	b.Helper()
 	ctx := context.Background()
 	w := newWalletID()
@@ -333,7 +333,7 @@ type hotRepo struct {
 }
 
 // warm opens n connections, so dialing is not timed
-func warm(b *testing.B, pool *pgxpool.Pool, n int) {
+func warm(b testing.TB, pool *pgxpool.Pool, n int) {
 	ctx := context.Background()
 	conns := make([]*pgxpool.Conn, n)
 	for i := range conns {
@@ -420,6 +420,24 @@ func BenchmarkHotAccountDebitSlowTx(b *testing.B) {
 		return func() { stop(); <-done }
 	}
 	runHot(b, cases, prepare, func(r WalletRepo, w int64) error {
+		_, err := r.Debit(ctx, w, model.USD, dec("1"))
+		return err
+	})
+}
+
+// the largest gap: debits from 1 worker, giving the time of one op, and from
+// 80, the most the database's 100 connections leave room for, at rtts up to
+// 5ms. the account model's peak is 1 / its lock span, the utxo model's is the
+// server's capacity or connections / time of one op, whichever is lower
+func BenchmarkHotAccountDebitPeak(b *testing.B) {
+	ctx := context.Background()
+	var cases []hotCase
+	for _, rtt := range []time.Duration{0, time.Millisecond, 2 * time.Millisecond, 5 * time.Millisecond} {
+		for _, workers := range []int{1, 80} {
+			cases = append(cases, hotCase{rtt: rtt, workers: workers, outputs: 128})
+		}
+	}
+	runHot(b, cases, nil, func(r WalletRepo, w int64) error {
 		_, err := r.Debit(ctx, w, model.USD, dec("1"))
 		return err
 	})

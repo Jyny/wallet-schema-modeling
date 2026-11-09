@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -61,6 +63,39 @@ func latencyPool(t testing.TB, cfg *pgxpool.Config, latency time.Duration, maxCo
 	return pool
 }
 
+// hotDebits funds a wallet with outputs credits on the undelayed pool, then
+// runs workers x debits concurrent debits on slow and returns their wall time
+func hotDebits(t *testing.T, pool, slow *pgxpool.Pool, newRepo func(*pgxpool.Pool) WalletRepo, workers, debits, outputs int) time.Duration {
+	t.Helper()
+	ctx := context.Background()
+	w := fundedWallet(t, newRepo(pool), outputs, "1000")
+	warm(t, slow, workers)
+	r := newRepo(slow)
+
+	var wg sync.WaitGroup
+	start := time.Now()
+	for range workers {
+		wg.Go(func() {
+			for range debits {
+				_, err := r.Debit(ctx, w, model.USD, dec("1"))
+				assert.NoError(t, err)
+			}
+		})
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	b, err := r.GetBalance(ctx, w, model.USD)
+	require.NoError(t, err)
+	want := decimal.NewFromInt(int64(outputs*1000 - workers*debits))
+	require.True(t, b.Available.Equal(want), "available: want %s, got %s", want, b.Available)
+	assertInvariants(t, pool, r, w)
+	return elapsed
+}
+
+func newAccountRepo(p *pgxpool.Pool) WalletRepo { return NewAccountWalletRepo(p) }
+func newUTXORepo(p *pgxpool.Pool) WalletRepo    { return NewUTXOWalletRepo(p) }
+
 // concurrent debits of one account, funded as many outputs, take less wall
 // time in the utxo model than in the account model
 func TestHotAccountUnderLatency(t *testing.T) {
@@ -73,47 +108,46 @@ func TestHotAccountUnderLatency(t *testing.T) {
 		debits  = 10 // per worker
 		outputs = 64
 	)
-	pool := setupLatencyDB(t, latency, workers)
-	ctx := context.Background()
-
-	run := func(t *testing.T, r WalletRepo) time.Duration {
-		w := newWalletID()
-		for range outputs {
-			_, err := r.Credit(ctx, w, model.USD, dec("1000"))
-			require.NoError(t, err)
-		}
-		// warm every connection so dialing is not timed
-		var wg sync.WaitGroup
-		for range workers {
-			wg.Go(func() { require.NoError(t, pool.Ping(ctx)) })
-		}
-		wg.Wait()
-
-		start := time.Now()
-		for range workers {
-			wg.Go(func() {
-				for range debits {
-					_, err := r.Debit(ctx, w, model.USD, dec("1"))
-					require.NoError(t, err)
-				}
-			})
-		}
-		wg.Wait()
-		elapsed := time.Since(start)
-
-		b, err := r.GetBalance(ctx, w, model.USD)
-		require.NoError(t, err)
-		want := decimal.NewFromInt(outputs*1000 - workers*debits)
-		require.True(t, b.Available.Equal(want), "available: want %s, got %s", want, b.Available)
-		assertInvariants(t, pool, r, w)
-		t.Logf("%d debits by %d workers, %s per round trip: %s, %s per debit",
-			workers*debits, workers, latency, elapsed, elapsed/(workers*debits))
-		return elapsed
-	}
+	pool := setupTestDB(t)
+	slow := setupLatencyDB(t, latency, workers)
 
 	var account, utxo time.Duration
-	t.Run("account", func(t *testing.T) { account = run(t, NewAccountWalletRepo(pool)) })
-	t.Run("utxo", func(t *testing.T) { utxo = run(t, NewUTXOWalletRepo(pool)) })
-	t.Logf("utxo / account: %.2fx", float64(utxo)/float64(account))
+	t.Run("account", func(t *testing.T) { account = hotDebits(t, pool, slow, newAccountRepo, workers, debits, outputs) })
+	t.Run("utxo", func(t *testing.T) { utxo = hotDebits(t, pool, slow, newUTXORepo, workers, debits, outputs) })
+	t.Logf("%d debits by %d workers, %s per round trip: account %s, utxo %s, utxo / account %.2fx",
+		workers*debits, workers, latency, account, utxo, float64(utxo)/float64(account))
 	require.Less(t, utxo, account, "utxo model should outpace the account model on a hot account")
+}
+
+// how far the gap goes: with enough workers the account model is capped by
+// its lock span, which grows with the rtt, while the utxo model is capped by
+// the server or by workers / time of one op. so the speedup grows with the
+// rtt, toward about workers x (account lock round trips / utxo op round trips),
+// ~N/4 here. 64 workers measure ~8x at 1ms and ~17x at 5ms; the bounds below
+// leave room for a slower machine
+func TestHotAccountPeakSpeedup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing test")
+	}
+	const (
+		workers = 64
+		debits  = 5 // per worker
+		outputs = 128
+	)
+	pool := setupTestDB(t)
+
+	speedup := map[time.Duration]float64{}
+	for _, latency := range []time.Duration{time.Millisecond, 5 * time.Millisecond} {
+		t.Run(fmt.Sprintf("rtt=%s", latency), func(t *testing.T) {
+			slow := setupLatencyDB(t, latency, workers)
+			account := hotDebits(t, pool, slow, newAccountRepo, workers, debits, outputs)
+			utxo := hotDebits(t, pool, slow, newUTXORepo, workers, debits, outputs)
+			speedup[latency] = float64(account) / float64(utxo)
+			t.Logf("%d debits by %d workers: account %s, utxo %s, utxo %.1fx faster",
+				workers*debits, workers, account, utxo, speedup[latency])
+		})
+	}
+	require.Greater(t, speedup[time.Millisecond], 3.0, "1ms rtt")
+	require.Greater(t, speedup[5*time.Millisecond], 8.0, "5ms rtt")
+	require.Greater(t, speedup[5*time.Millisecond], speedup[time.Millisecond], "the gap should grow with the rtt")
 }
