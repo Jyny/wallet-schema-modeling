@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -441,4 +442,226 @@ func BenchmarkHotAccountDebitPeak(b *testing.B) {
 		_, err := r.Debit(ctx, w, model.USD, dec("1"))
 		return err
 	})
+}
+
+// read and hold interaction on one account, `make go.bench.interact`: reads
+// timed while holds run against the account, and holds timed while reads poll
+// it. reads take no locks in either model, so neither side should wait on the
+// other; what they share is the database and, in the utxo model, the outputs
+// the holds leave for the reads to sum. holds run with rtt added to every
+// round trip, lengthening the locks they take; reads run undelayed, so their
+// time is the database's, not the network's. the wallet starts from 64 outputs
+
+type interactCase struct {
+	rtt     time.Duration
+	holders int // hold then release, on a pool delayed by rtt
+	readers int // reads, undelayed
+}
+
+func (c interactCase) String() string {
+	return fmt.Sprintf("rtt=%s/holders=%d/readers=%d", c.rtt, c.holders, c.readers)
+}
+
+func holdRelease(r WalletRepo, w int64) error {
+	ctx := context.Background()
+	h, err := r.Hold(ctx, w, model.USD, dec("1"))
+	if err != nil {
+		return err
+	}
+	_, err = r.ReleaseHold(ctx, h.ID)
+	return err
+}
+
+// runInteract times either the reads or the holds of each case, as named by
+// timed, while the other side runs in the background until the timed side
+// finishes. the background side's throughput is reported per timed op
+func runInteract(b *testing.B, cases []interactCase, timed string, read func(r WalletRepo, w int64) error) {
+	pool := setupTestDB(b)
+	for _, c := range cases {
+		slow := latencyPool(b, pool.Config(), c.rtt, int32(max(c.holders, 1)))
+		repos := []hotRepo{
+			{"account", NewAccountWalletRepo(pool), NewAccountWalletRepo(slow)},
+			{"utxo", NewUTXOWalletRepo(pool), NewUTXOWalletRepo(slow)},
+		}
+		for _, r := range repos {
+			b.Run(fmt.Sprintf("%s/%s", c, r.name), func(b *testing.B) {
+				w := fundedWallet(b, r.setup, 64, "1000000000")
+				warm(b, slow, c.holders)
+
+				type side struct {
+					workers int
+					op      func() error
+				}
+				holds := side{c.holders, func() error { return holdRelease(r.repo, w) }}
+				reads := side{c.readers, func() error { return read(r.setup, w) }}
+				fg, bg, bgName := reads, holds, "holds/op"
+				if timed == "holds" {
+					fg, bg, bgName = holds, reads, "reads/op"
+				}
+
+				var done, bgOps, failed atomic.Int64
+				var bgs, fgs sync.WaitGroup
+				run := func(op func() error) bool {
+					err := op()
+					if errors.Is(err, ErrContended) {
+						failed.Add(1)
+						return true
+					}
+					if err != nil {
+						b.Error(err)
+						return false
+					}
+					return true
+				}
+				for range bg.workers {
+					bgs.Go(func() {
+						// counts only ops finished while the timed side runs
+						for done.Load() == 0 && run(bg.op) {
+							if done.Load() == 0 {
+								bgOps.Add(1)
+							}
+						}
+					})
+				}
+				var next atomic.Int64
+				b.ResetTimer()
+				for range fg.workers {
+					fgs.Go(func() {
+						for next.Add(1) <= int64(b.N) && run(fg.op) {
+						}
+					})
+				}
+				fgs.Wait()
+				b.StopTimer()
+				done.Store(1)
+				bgs.Wait()
+				if bg.workers > 0 {
+					b.ReportMetric(float64(bgOps.Load())/float64(b.N), bgName)
+				}
+				b.ReportMetric(float64(failed.Load())/float64(b.N), "contended/op")
+			})
+		}
+		slow.Close()
+	}
+}
+
+// reads of one account, alone and while 16 workers hold and release on it
+func BenchmarkInteractReadDuringHolds(b *testing.B) {
+	ctx := context.Background()
+	var cases []interactCase
+	for _, rtt := range []time.Duration{0, time.Millisecond} {
+		for _, holders := range []int{0, 16} {
+			cases = append(cases, interactCase{rtt: rtt, holders: holders, readers: 8})
+		}
+	}
+	b.Run("get", func(b *testing.B) {
+		runInteract(b, cases, "reads", func(r WalletRepo, w int64) error {
+			_, err := r.GetBalance(ctx, w, model.USD)
+			return err
+		})
+	})
+	b.Run("list", func(b *testing.B) {
+		runInteract(b, cases, "reads", func(r WalletRepo, w int64) error {
+			_, err := r.ListBalances(ctx, w)
+			return err
+		})
+	})
+}
+
+// holds and releases of one account from 16 workers, alone and while 8
+// readers poll its balance
+func BenchmarkInteractHoldDuringReads(b *testing.B) {
+	ctx := context.Background()
+	var cases []interactCase
+	for _, rtt := range []time.Duration{0, time.Millisecond} {
+		for _, readers := range []int{0, 8} {
+			cases = append(cases, interactCase{rtt: rtt, holders: 16, readers: readers})
+		}
+	}
+	runInteract(b, cases, "holds", func(r WalletRepo, w int64) error {
+		_, err := r.GetBalance(ctx, w, model.USD)
+		return err
+	})
+}
+
+// writes spread over several accounts, `make go.bench.multi`: 32 workers debit
+// accounts picked uniformly or by a zipf distribution, each account a wallet
+// funded with 16 outputs. one account is the hot account case; the more
+// accounts, the fewer workers queue on each account row
+
+type multiCase struct {
+	rtt      time.Duration
+	accounts int
+	zipf     bool // accounts by rank, the first taking the most ops
+}
+
+const (
+	multiWorkers = 32
+	multiOutputs = 16
+	multiZipfS   = 1.1 // with 64 accounts the first takes ~1/4 of the ops, the first 4 ~1/2
+)
+
+func (c multiCase) String() string {
+	dist := "uniform"
+	if c.zipf {
+		dist = "zipf"
+	}
+	return fmt.Sprintf("rtt=%s/accounts=%d/%s", c.rtt, c.accounts, dist)
+}
+
+func BenchmarkMultiAccountDebit(b *testing.B) {
+	ctx := context.Background()
+	pool := setupTestDB(b)
+	var cases []multiCase
+	for _, rtt := range []time.Duration{0, time.Millisecond} {
+		for _, n := range []int{1, 4, 16, 64} {
+			cases = append(cases, multiCase{rtt: rtt, accounts: n})
+		}
+		cases = append(cases, multiCase{rtt: rtt, accounts: 64, zipf: true})
+	}
+	for _, c := range cases {
+		slow := latencyPool(b, pool.Config(), c.rtt, multiWorkers)
+		repos := []hotRepo{
+			{"account", NewAccountWalletRepo(pool), NewAccountWalletRepo(slow)},
+			{"utxo", NewUTXOWalletRepo(pool), NewUTXOWalletRepo(slow)},
+		}
+		for _, r := range repos {
+			// funded once per case: the debits barely dent the outputs
+			wallets := make([]int64, c.accounts)
+			for i := range wallets {
+				wallets[i] = fundedWallet(b, r.setup, multiOutputs, "1000000000")
+			}
+			b.Run(fmt.Sprintf("%s/%s", c, r.name), func(b *testing.B) {
+				warm(b, slow, multiWorkers)
+				var next, failed atomic.Int64
+				var wg sync.WaitGroup
+				b.ResetTimer()
+				for i := range multiWorkers {
+					wg.Go(func() {
+						rng := rand.New(rand.NewPCG(uint64(i), 17))
+						pick := func() int { return rng.IntN(c.accounts) }
+						if c.zipf {
+							z := rand.NewZipf(rng, multiZipfS, 1, uint64(c.accounts-1))
+							pick = func() int { return int(z.Uint64()) }
+						}
+						for next.Add(1) <= int64(b.N) {
+							_, err := r.repo.Debit(ctx, wallets[pick()], model.USD, dec("1"))
+							if errors.Is(err, ErrContended) {
+								failed.Add(1)
+								continue
+							}
+							if err != nil {
+								b.Error(err)
+								return
+							}
+						}
+					})
+				}
+				wg.Wait()
+				b.StopTimer()
+				b.ReportMetric(float64(failed.Load())/float64(b.N), "contended/op")
+			})
+		}
+		slow.Close()
+	}
 }

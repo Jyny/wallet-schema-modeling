@@ -12,38 +12,19 @@ import (
 	"github.com/shopspring/decimal"
 )
 
-const accountCloseHold = `-- name: AccountCloseHold :one
-UPDATE account_hold
-SET status = $1, updated_at = now()
-WHERE hold_id = $2 AND status = 'active'
-RETURNING wallet_id, currency, amount
-`
-
-type AccountCloseHoldParams struct {
-	Status string
-	HoldID uuid.UUID
-}
-
-type AccountCloseHoldRow struct {
-	WalletID int64
-	Currency string
-	Amount   decimal.Decimal
-}
-
-// active -> released | settled. no rows when the hold is unknown or closed
-func (q *Queries) AccountCloseHold(ctx context.Context, arg AccountCloseHoldParams) (AccountCloseHoldRow, error) {
-	row := q.db.QueryRow(ctx, accountCloseHold, arg.Status, arg.HoldID)
-	var i AccountCloseHoldRow
-	err := row.Scan(&i.WalletID, &i.Currency, &i.Amount)
-	return i, err
-}
-
 const accountCredit = `-- name: AccountCredit :one
-INSERT INTO account (wallet_id, currency, available)
-VALUES ($1, $2, $3)
-ON CONFLICT (wallet_id, currency) DO UPDATE
-SET available = account.available + EXCLUDED.available, updated_at = now()
-RETURNING currency, available, held
+
+WITH b AS (
+  INSERT INTO account (wallet_id, currency, available)
+  VALUES ($1, $2, $3::numeric)
+  ON CONFLICT (wallet_id, currency) DO UPDATE
+  SET available = account.available + EXCLUDED.available, updated_at = now()
+  RETURNING wallet_id, currency, available, held
+), e AS (
+  INSERT INTO account_entry (wallet_id, currency, kind, available_delta, held_delta)
+  SELECT wallet_id, currency, 'credit', $3::numeric, 0 FROM b
+)
+SELECT currency, available, held FROM b
 `
 
 type AccountCreditParams struct {
@@ -58,6 +39,11 @@ type AccountCreditRow struct {
 	Held      decimal.Decimal
 }
 
+// every write is one statement: the account row update and its entry (and
+// for holds the hold row) are data-modifying CTEs of a single query, so the
+// row stays locked from that statement until COMMIT, one round trip, rather
+// than across a statement per table. a guard that fails leaves the first CTE
+// empty, nothing is written and the query returns no rows
 // available += amount, creating the row on first credit
 func (q *Queries) AccountCredit(ctx context.Context, arg AccountCreditParams) (AccountCreditRow, error) {
 	row := q.db.QueryRow(ctx, accountCredit, arg.WalletID, arg.Currency, arg.Amount)
@@ -67,11 +53,17 @@ func (q *Queries) AccountCredit(ctx context.Context, arg AccountCreditParams) (A
 }
 
 const accountDebit = `-- name: AccountDebit :one
-UPDATE account
-SET available = available - $1::numeric, updated_at = now()
-WHERE wallet_id = $2 AND currency = $3
-AND available >= $1::numeric
-RETURNING currency, available, held
+WITH b AS (
+  UPDATE account AS a
+  SET available = a.available - $1::numeric, updated_at = now()
+  WHERE a.wallet_id = $2 AND a.currency = $3
+  AND a.available >= $1::numeric
+  RETURNING a.wallet_id, a.currency, a.available, a.held
+), e AS (
+  INSERT INTO account_entry (wallet_id, currency, kind, available_delta, held_delta)
+  SELECT wallet_id, currency, 'debit', -$1::numeric, 0 FROM b
+)
+SELECT currency, available, held FROM b
 `
 
 type AccountDebitParams struct {
@@ -127,20 +119,31 @@ func (q *Queries) AccountGetBalance(ctx context.Context, arg AccountGetBalancePa
 }
 
 const accountHold = `-- name: AccountHold :one
-UPDATE account
-SET
-  available = available - $1::numeric,
-  held = held + $1::numeric,
-  updated_at = now()
-WHERE wallet_id = $2 AND currency = $3
-AND available >= $1::numeric
-RETURNING currency, available, held
+WITH b AS (
+  UPDATE account AS a
+  SET
+    available = a.available - $1::numeric,
+    held = a.held + $1::numeric,
+    updated_at = now()
+  WHERE a.wallet_id = $2 AND a.currency = $3
+  AND a.available >= $1::numeric
+  RETURNING a.wallet_id, a.currency, a.available, a.held
+), h AS (
+  INSERT INTO account_hold (hold_id, wallet_id, currency, amount)
+  SELECT $4::uuid, wallet_id, currency, $1::numeric FROM b
+), e AS (
+  INSERT INTO account_entry (wallet_id, currency, kind, available_delta, held_delta, hold_id)
+  SELECT wallet_id, currency, 'hold', -$1::numeric, $1::numeric, $4::uuid
+  FROM b
+)
+SELECT currency, available, held FROM b
 `
 
 type AccountHoldParams struct {
 	Amount   decimal.Decimal
 	WalletID int64
 	Currency string
+	HoldID   uuid.UUID
 }
 
 type AccountHoldRow struct {
@@ -149,60 +152,18 @@ type AccountHoldRow struct {
 	Held      decimal.Decimal
 }
 
-// available -> held. no rows when funds are insufficient
+// available -> held, recorded as an active hold. no rows when funds are
+// insufficient
 func (q *Queries) AccountHold(ctx context.Context, arg AccountHoldParams) (AccountHoldRow, error) {
-	row := q.db.QueryRow(ctx, accountHold, arg.Amount, arg.WalletID, arg.Currency)
+	row := q.db.QueryRow(ctx, accountHold,
+		arg.Amount,
+		arg.WalletID,
+		arg.Currency,
+		arg.HoldID,
+	)
 	var i AccountHoldRow
 	err := row.Scan(&i.Currency, &i.Available, &i.Held)
 	return i, err
-}
-
-const accountInsertEntry = `-- name: AccountInsertEntry :exec
-INSERT INTO account_entry (wallet_id, currency, kind, available_delta, held_delta, hold_id)
-VALUES ($1, $2, $3, $4, $5, $6)
-`
-
-type AccountInsertEntryParams struct {
-	WalletID       int64
-	Currency       string
-	Kind           string
-	AvailableDelta decimal.Decimal
-	HeldDelta      decimal.Decimal
-	HoldID         uuid.NullUUID
-}
-
-func (q *Queries) AccountInsertEntry(ctx context.Context, arg AccountInsertEntryParams) error {
-	_, err := q.db.Exec(ctx, accountInsertEntry,
-		arg.WalletID,
-		arg.Currency,
-		arg.Kind,
-		arg.AvailableDelta,
-		arg.HeldDelta,
-		arg.HoldID,
-	)
-	return err
-}
-
-const accountInsertHold = `-- name: AccountInsertHold :exec
-INSERT INTO account_hold (hold_id, wallet_id, currency, amount)
-VALUES ($1, $2, $3, $4)
-`
-
-type AccountInsertHoldParams struct {
-	HoldID   uuid.UUID
-	WalletID int64
-	Currency string
-	Amount   decimal.Decimal
-}
-
-func (q *Queries) AccountInsertHold(ctx context.Context, arg AccountInsertHoldParams) error {
-	_, err := q.db.Exec(ctx, accountInsertHold,
-		arg.HoldID,
-		arg.WalletID,
-		arg.Currency,
-		arg.Amount,
-	)
-	return err
 }
 
 const accountListBalances = `-- name: AccountListBalances :many
@@ -242,59 +203,83 @@ func (q *Queries) AccountListBalances(ctx context.Context, walletID int64) ([]Ac
 	return items, nil
 }
 
-const accountRelease = `-- name: AccountRelease :one
-UPDATE account
-SET
-  available = available + $1::numeric,
-  held = held - $1::numeric,
-  updated_at = now()
-WHERE wallet_id = $2 AND currency = $3
-RETURNING currency, available, held
+const accountReleaseHold = `-- name: AccountReleaseHold :one
+WITH h AS (
+  UPDATE account_hold AS ah
+  SET status = 'released', updated_at = now()
+  WHERE ah.hold_id = $1 AND ah.status = 'active'
+  RETURNING ah.hold_id, ah.wallet_id, ah.currency, ah.amount
+), b AS (
+  UPDATE account AS a
+  SET available = a.available + h.amount, held = a.held - h.amount, updated_at = now()
+  FROM h
+  WHERE a.wallet_id = h.wallet_id AND a.currency = h.currency
+  RETURNING a.wallet_id, a.currency, a.available, a.held, h.amount, h.hold_id
+), e AS (
+  INSERT INTO account_entry (wallet_id, currency, kind, available_delta, held_delta, hold_id)
+  SELECT wallet_id, currency, 'release', amount, -amount, hold_id FROM b
+)
+SELECT wallet_id, currency, available, held FROM b
 `
 
-type AccountReleaseParams struct {
-	Amount   decimal.Decimal
-	WalletID int64
-	Currency string
-}
-
-type AccountReleaseRow struct {
+type AccountReleaseHoldRow struct {
+	WalletID  int64
 	Currency  string
 	Available decimal.Decimal
 	Held      decimal.Decimal
 }
 
-// held -> available
-func (q *Queries) AccountRelease(ctx context.Context, arg AccountReleaseParams) (AccountReleaseRow, error) {
-	row := q.db.QueryRow(ctx, accountRelease, arg.Amount, arg.WalletID, arg.Currency)
-	var i AccountReleaseRow
-	err := row.Scan(&i.Currency, &i.Available, &i.Held)
+// active hold -> released, held -> available. no rows when the hold is
+// unknown or closed: a concurrent close of the same hold waits on its row,
+// then finds it closed
+func (q *Queries) AccountReleaseHold(ctx context.Context, holdID uuid.UUID) (AccountReleaseHoldRow, error) {
+	row := q.db.QueryRow(ctx, accountReleaseHold, holdID)
+	var i AccountReleaseHoldRow
+	err := row.Scan(
+		&i.WalletID,
+		&i.Currency,
+		&i.Available,
+		&i.Held,
+	)
 	return i, err
 }
 
-const accountSettle = `-- name: AccountSettle :one
-UPDATE account
-SET held = held - $1::numeric, updated_at = now()
-WHERE wallet_id = $2 AND currency = $3
-RETURNING currency, available, held
+const accountSettleHold = `-- name: AccountSettleHold :one
+WITH h AS (
+  UPDATE account_hold AS ah
+  SET status = 'settled', updated_at = now()
+  WHERE ah.hold_id = $1 AND ah.status = 'active'
+  RETURNING ah.hold_id, ah.wallet_id, ah.currency, ah.amount
+), b AS (
+  UPDATE account AS a
+  SET held = a.held - h.amount, updated_at = now()
+  FROM h
+  WHERE a.wallet_id = h.wallet_id AND a.currency = h.currency
+  RETURNING a.wallet_id, a.currency, a.available, a.held, h.amount, h.hold_id
+), e AS (
+  INSERT INTO account_entry (wallet_id, currency, kind, available_delta, held_delta, hold_id)
+  SELECT wallet_id, currency, 'settle', 0, -amount, hold_id FROM b
+)
+SELECT wallet_id, currency, available, held FROM b
 `
 
-type AccountSettleParams struct {
-	Amount   decimal.Decimal
-	WalletID int64
-	Currency string
-}
-
-type AccountSettleRow struct {
+type AccountSettleHoldRow struct {
+	WalletID  int64
 	Currency  string
 	Available decimal.Decimal
 	Held      decimal.Decimal
 }
 
-// held -> out of the wallet
-func (q *Queries) AccountSettle(ctx context.Context, arg AccountSettleParams) (AccountSettleRow, error) {
-	row := q.db.QueryRow(ctx, accountSettle, arg.Amount, arg.WalletID, arg.Currency)
-	var i AccountSettleRow
-	err := row.Scan(&i.Currency, &i.Available, &i.Held)
+// active hold -> settled, held -> out of the wallet. no rows when the hold is
+// unknown or closed
+func (q *Queries) AccountSettleHold(ctx context.Context, holdID uuid.UUID) (AccountSettleHoldRow, error) {
+	row := q.db.QueryRow(ctx, accountSettleHold, holdID)
+	var i AccountSettleHoldRow
+	err := row.Scan(
+		&i.WalletID,
+		&i.Currency,
+		&i.Available,
+		&i.Held,
+	)
 	return i, err
 }

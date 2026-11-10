@@ -301,6 +301,19 @@ go.bench.hot:
 	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s -timeout 60m \
 	-bench 'HotAccount' ./repo
 
+# read and hold interaction: reads timed while holds run on the same account,
+# and holds timed while reads poll it
+.PHONY: go.bench.interact
+go.bench.interact:
+	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s -timeout 30m \
+	-bench 'Interact' ./repo
+
+# writes spread over 1..64 accounts, uniformly and zipf distributed
+.PHONY: go.bench.multi
+go.bench.multi:
+	TEST_REQUIRE_DB=1 go test -run '^$$' -count $(BENCH_COUNT) -benchtime 1s -timeout 30m \
+	-bench 'MultiAccount' ./repo
+
 # seed demo wallets 1..3 into both models through the repos (replaces them)
 .PHONY: db.seed
 db.seed:
