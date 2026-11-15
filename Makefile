@@ -19,6 +19,10 @@ DB_PASSWORD ?= passwd
 DB_NAME ?= default
 export $(ENV_KEYS)
 
+# database for the go tests, which build and drop their own schema inside it
+DATABASE_URL ?= postgres://$(DB_USER):$(DB_PASSWORD)@localhost:5432/$(DB_NAME)?sslmode=disable
+export DATABASE_URL
+
 # a bare `make` would otherwise run the first target (infra.up) and silently
 # start docker
 .DEFAULT_GOAL := help
@@ -62,7 +66,11 @@ help:
 		"ATLAS_LINT_BASE=$(ATLAS_LINT_BASE)" "git base to lint against instead (CI)" \
 		"DC=$(DC)" "docker compose cli" \
 		"ATLAS=$(ATLAS)" "atlas cli" \
-		"SQLC=$(SQLC)" "sqlc cli"
+		"SQLC=$(SQLC)" "sqlc cli" \
+		"DATABASE_URL=$(DATABASE_URL)" "database for the go tests" \
+		"BENCH_TIME=$(BENCH_TIME)" "duration (2s) or iterations (1000x) per benchmark" \
+		"BENCH_COUNT=$(BENCH_COUNT)" "runs per benchmark, for benchstat" \
+		"BENCH_WORKERS=$(BENCH_WORKERS)" "concurrent clients per benchmark"
 
 
 # docker cli
@@ -268,6 +276,34 @@ sqlc.compile:
 .PHONY: sqlc.diff
 sqlc.diff:
 	$(SQLC) diff
+
+
+# go
+# the repo tests only need a running database (infra.up): they replay
+# migration/ into a schema of their own, wallet_test, and drop it afterwards
+GO_TEST = TEST_REQUIRE_DB=1 go test
+BENCH_TIME ?= 2s
+BENCH_COUNT ?= 1
+BENCH_WORKERS ?= 64
+export BENCH_WORKERS
+GO_BENCH = $(GO_TEST) -run '^$$' -benchtime $(BENCH_TIME) -count $(BENCH_COUNT) -timeout 120m
+
+# run the tests: business scenarios and concurrent correctness on both models
+.PHONY: go.test
+go.test:
+	$(GO_TEST) -count=1 ./...
+
+# benchmark business scenarios under concurrent load on both models
+.PHONY: go.bench
+go.bench:
+	$(GO_BENCH) -bench 'Scenario|HotWallet' ./repo
+
+# benchmark the mixed scenario as wallets, outputs and history grow (minutes)
+# levels: CARDINALITY_WALLETS, CARDINALITY_OUTPUTS, CARDINALITY_HISTORY, e.g.
+# `CARDINALITY_WALLETS=1000,100000 make go.bench.scale`
+.PHONY: go.bench.scale
+go.bench.scale:
+	$(GO_BENCH) -bench 'Cardinality' ./repo
 
 
 # db
