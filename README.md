@@ -19,6 +19,7 @@ query/              sqlc queries: currency.sql, account.sql, utxo.sql
 repo/db/            sqlc generated code (do not edit)
 model/              Balance, Hold, Currency
 repo/               WalletRepo interface, AccountWalletRepo, UTXOWalletRepo
+repo/*_test.go      tests and benchmarks run against both models, see Tests
 ```
 
 ## Quick start
@@ -135,4 +136,3 @@ and a self-auditing history.
 
 Not modeled: consolidating small outputs (B), partial settle, transfers
 between wallets, a `wallet` table (wallet ids are external references).
-

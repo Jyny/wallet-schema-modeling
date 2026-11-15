@@ -2,3 +2,5 @@
 .idea/
 # local settings and credentials, see .env.example
 .env
+# benchmark results, see `make go.bench`
+bench/

@@ -48,6 +48,11 @@ func envInts(name string, def ...int) []int {
 // benchOp is one business operation by one client.
 type benchOp func(ctx context.Context, rng *rand.Rand) error
 
+// warmupOps is how many untimed operations each worker runs before a
+// measurement: enough to open every pool connection and prepare its
+// statements, which would otherwise land in the first measured run
+const warmupOps = 4
+
 // load runs op b.N times from benchWorkers goroutines.
 func load(b *testing.B, op benchOp) {
 	b.Helper()
@@ -55,6 +60,19 @@ func load(b *testing.B, op benchOp) {
 	var next, contended atomic.Int64
 	latencies := make([][]time.Duration, benchWorkers)
 	var wg sync.WaitGroup
+
+	for w := range benchWorkers {
+		wg.Go(func() {
+			rng := rand.New(rand.NewPCG(uint64(w), 0))
+			for range warmupOps {
+				if err := op(ctx, rng); err != nil && !errors.Is(err, ErrContended) {
+					b.Error(err)
+					return
+				}
+			}
+		})
+	}
+	wg.Wait()
 
 	b.ResetTimer()
 	start := time.Now()
@@ -200,6 +218,16 @@ func reseeder(s seedSpec) func(b *testing.B) {
 	}
 }
 
+// benchRepos is repos in random order: within a round both models run on the
+// same seed one after the other, so a fixed order would hand one of them
+// whatever drifts over the round, such as autovacuum or checkpoints. across
+// rounds the order evens out.
+func benchRepos() []namedRepo {
+	r := repos()
+	rand.Shuffle(len(r), func(i, j int) { r[i], r[j] = r[j], r[i] })
+	return r
+}
+
 // each business scenario with the load spread over 1000 wallets
 func BenchmarkScenario(b *testing.B) {
 	const wallets = 1000
@@ -218,8 +246,8 @@ func BenchmarkScenario(b *testing.B) {
 	setup(b)
 	for _, s := range scenarios {
 		reseed := reseeder(benchSeed(wallets))
-		for _, impl := range repos() {
-			b.Run(s.name+"/"+impl.name, func(b *testing.B) {
+		for _, impl := range benchRepos() {
+			b.Run("scenario="+s.name+"/model="+impl.name, func(b *testing.B) {
 				reseed(b)
 				load(b, s.op(impl.repo, wallets))
 			})
@@ -234,8 +262,8 @@ func BenchmarkHotWallet(b *testing.B) {
 	setup(b)
 	for _, outputs := range []int{1, 64, 1024} {
 		reseed := reseeder(seedSpec{wallets: 1, cur: model.USD, outputs: outputs, amount: "1000000000"})
-		for _, impl := range repos() {
-			b.Run(fmt.Sprintf("outputs=%d/%s", outputs, impl.name), func(b *testing.B) {
+		for _, impl := range benchRepos() {
+			b.Run(fmt.Sprintf("outputs=%d/model=%s", outputs, impl.name), func(b *testing.B) {
 				reseed(b)
 				load(b, opPayment(impl.repo, 1))
 			})
@@ -244,7 +272,7 @@ func BenchmarkHotWallet(b *testing.B) {
 }
 
 // cardinality growth: the mixed scenario, same concurrency, on ever more
-// data: `make go.bench.cardinality`. a model scales when its numbers stay
+// data: `make go.bench.scale`. a model scales when its numbers stay
 // flat from one level to the next.
 
 func benchCardinality(b *testing.B, label string, levels []int, spec func(level int) seedSpec) {
@@ -252,8 +280,8 @@ func benchCardinality(b *testing.B, label string, levels []int, spec func(level 
 	for _, level := range levels {
 		s := spec(level)
 		reseed := reseeder(s)
-		for _, impl := range repos() {
-			b.Run(fmt.Sprintf("%s=%d/%s", label, level, impl.name), func(b *testing.B) {
+		for _, impl := range benchRepos() {
+			b.Run(fmt.Sprintf("%s=%d/model=%s", label, level, impl.name), func(b *testing.B) {
 				reseed(b)
 				load(b, opMixed(impl.repo, s.wallets))
 				reportRows(b)

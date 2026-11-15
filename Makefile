@@ -69,7 +69,7 @@ help:
 		"SQLC=$(SQLC)" "sqlc cli" \
 		"DATABASE_URL=$(DATABASE_URL)" "database for the go tests" \
 		"BENCH_TIME=$(BENCH_TIME)" "duration (2s) or iterations (1000x) per benchmark" \
-		"BENCH_COUNT=$(BENCH_COUNT)" "runs per benchmark, for benchstat" \
+		"BENCH_COUNT=$(BENCH_COUNT)" "rounds per benchmark, each a fresh process and seed" \
 		"BENCH_WORKERS=$(BENCH_WORKERS)" "concurrent clients per benchmark"
 
 
@@ -283,10 +283,26 @@ sqlc.diff:
 # migration/ into a schema of their own, wallet_test, and drop it afterwards
 GO_TEST = TEST_REQUIRE_DB=1 go test
 BENCH_TIME ?= 2s
-BENCH_COUNT ?= 1
+BENCH_COUNT ?= 10
 BENCH_WORKERS ?= 64
 export BENCH_WORKERS
-GO_BENCH = $(GO_TEST) -run '^$$' -benchtime $(BENCH_TIME) -count $(BENCH_COUNT) -timeout 120m
+BENCH_OUT ?= bench
+BENCHSTAT ?= go run golang.org/x/perf/cmd/benchstat@v0.0.0-20261009192801-be2c69fb417e
+
+# run benchmarks $(1) BENCH_COUNT rounds into $(BENCH_OUT)/$(2).txt, then put
+# the models side by side with benchstat (median and 95% confidence interval).
+# each round is a fresh process on a fresh seed: `go test -count` would repeat
+# each benchmark back to back on one seed, so its samples are not independent
+define go.bench.rounds
+@mkdir -p $(BENCH_OUT)
+@rm -f $(BENCH_OUT)/$(2).txt
+@set -o pipefail; for i in $$(seq $(BENCH_COUNT)); do \
+	echo "round $$i/$(BENCH_COUNT)"; \
+	$(GO_TEST) -run '^$$' -bench '$(1)' -benchtime $(BENCH_TIME) -count 1 -timeout 120m ./repo \
+	| tee -a $(BENCH_OUT)/$(2).txt || exit 1; \
+done
+$(BENCHSTAT) -col /model $(BENCH_OUT)/$(2).txt
+endef
 
 # run the tests: business scenarios and concurrent correctness on both models
 .PHONY: go.test
@@ -296,15 +312,14 @@ go.test:
 # benchmark business scenarios under concurrent load on both models
 .PHONY: go.bench
 go.bench:
-	$(GO_BENCH) -bench 'Scenario|HotWallet' ./repo
+	$(call go.bench.rounds,Scenario|HotWallet,scenario)
 
-# benchmark the mixed scenario as wallets, outputs and history grow (minutes)
+# benchmark the mixed scenario as wallets, outputs and history grow (long)
 # levels: CARDINALITY_WALLETS, CARDINALITY_OUTPUTS, CARDINALITY_HISTORY, e.g.
 # `CARDINALITY_WALLETS=1000,100000 make go.bench.scale`
 .PHONY: go.bench.scale
 go.bench.scale:
-	$(GO_BENCH) -bench 'Cardinality' ./repo
-
+	$(call go.bench.rounds,Cardinality,scale)
 
 # db
 
