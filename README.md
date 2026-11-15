@@ -29,6 +29,7 @@ Docker.
 
 ```bash
 make db.init     # infra.up + migrate.apply
+make go.test     # tests against the local database, see Tests
 make             # list every target
 ```
 
@@ -136,3 +137,120 @@ and a self-auditing history.
 
 Not modeled: consolidating small outputs (B), partial settle, transfers
 between wallets, a `wallet` table (wallet ids are external references).
+
+## Tests
+
+```bash
+make infra.up    # the tests only need a running database
+make go.test     # about 20s
+```
+
+The tests build a schema of their own, `wallet_test`, inside `DATABASE_URL`
+by replaying `migration/`, and drop it afterwards, so whatever else the
+database holds is never touched. Every test runs against both models.
+
+- `repo/scenario_test.go`: business scenarios (deposit and withdraw, hold then
+  settle or release, transfer, independent currencies, invalid requests), and
+  a check that both models agree after the same operations
+- `repo/concurrency_test.go`: concurrent debits and holds never overdraw, a
+  hold closes only once, transfers conserve the total, a mixed workload
+  matches its ledger, reads see whole operations
+
+A plain `go test ./...` skips the package when the database is unreachable;
+`make go.test` sets `TEST_REQUIRE_DB=1` and fails instead.
+
+## Benchmarks
+
+```bash
+make go.bench                        # scenarios and hot wallet, 6 to 10 min
+BENCH_COUNT=6 make go.bench.scale    # cardinality sweeps, 25 to 40 min
+```
+
+Both run the same load against both models (`repo/bench_test.go`): 64
+concurrent clients (`BENCH_WORKERS`) over a pool of 32 connections, 2s per
+benchmark (`BENCH_TIME`). Each round (`BENCH_COUNT`) is a fresh process on a
+fresh seed, with the models in random order. Raw results land in
+`bench/scenario.txt` and `bench/scale.txt` (git-ignored) and each target ends
+with a benchstat summary: median and 95% confidence interval per model. Run
+them one after the other on an otherwise idle machine: they share the
+database.
+
+Each benchmark reports wall time per operation across all clients (`sec/op`),
+`ops/s`, the `p50-ms` and `p99-ms` latency of one operation, and
+`contended/op`, the share of operations the UTXO model gave up on with
+`ErrContended`.
+
+### Results
+
+2026-11-15, Intel Core i7-12700 (20 logical CPUs), 62 GiB RAM, EndeavourOS on
+Linux 7.2.11, Go 1.27.4, PostgreSQL 18.7 in Docker 29.9.2 with no CPU or
+memory limit. The container used host networking instead of the published
+port of `docker-compose.yaml`, so connections skipped Docker's port
+forwarding. Medians; the ± column is the 95% confidence interval where it is
+wider than ±10%.
+
+**Scenarios** (`make go.bench`, 10 rounds), load spread over 1000 wallets:
+
+| scenario     | utxo    | ±   | account | ±   | account vs utxo | utxo ops/s | account ops/s |
+| ------------ | ------: | --: | ------: | --: | --------------: | ---------: | ------------: |
+| balance      | 3.94µs  |     | 3.52µs  |     | -11%            | 253.6k     | 283.9k        |
+| deposit      | 50.1µs  | 32% | 39.0µs  | 49% | -22%            | 19.95k     | 25.63k        |
+| withdraw     | 62.5µs  | 48% | 38.5µs  | 51% | -38%            | 16.00k     | 25.98k        |
+| payment      | 119.3µs |     | 90.7µs  | 22% | -24%            | 8.38k      | 11.03k        |
+| hold-release | 124.0µs |     | 91.2µs  |     | -26%            | 8.07k      | 10.97k        |
+| transfer     | 164.8µs |     | 129.1µs |     | -22%            | 6.07k      | 7.75k         |
+| mixed        | 57.7µs  |     | 45.4µs  |     | -21%            | 17.34k     | 22.04k        |
+
+`mixed` is 50% balance, 20% payment, 15% transfer, 10% deposit, 5% withdraw.
+The wide intervals on deposit, withdraw and payment come from rounds 1 and 2,
+which ran 30 to 50% slower than rounds 3 to 10 on both models, on a database
+volume created minutes earlier; the later rounds agree within about 3%.
+
+**Hot wallet**, every client paying from one wallet funded by N outputs:
+
+| outputs | utxo   | account | account vs utxo | utxo p50 / p99  | account p50 / p99 |
+| ------: | -----: | ------: | --------------: | --------------: | ----------------: |
+| 1       | 1.55ms | 1.39ms  | ~ (p=0.105)     | 42.6 / 575.8 ms | 81.4 / 180.6 ms   |
+| 64      | 230µs  | 1.39ms  | +503%           | 14.5 / 23.0 ms  | 81.5 / 182.9 ms   |
+| 1024    | 447µs  | 1.40ms  | +213%           | 28.6 / 48.8 ms  | 81.9 / 181.6 ms   |
+
+- With the load spread over wallets the account model is 20 to 40% faster on
+  every write and 11% faster on reads.
+- On one hot wallet the account model serializes at about 720 ops/s whatever
+  the wallet holds. The UTXO model reaches 4.3k ops/s with 64 outputs to pick
+  from and 2.2k with 1024, where selection and the balance read cost more.
+- With a single output the UTXO model is at its worst case: clients chain
+  through each other's change. Throughput matches the account model, p99 is
+  three times higher (576 ms vs 181 ms) and 0.2% of operations returned
+  `ErrContended` (interval ±128%), the only benchmark where any did.
+
+**Cardinality** (`BENCH_COUNT=6 make go.bench.scale`, 6 rounds), the mixed
+scenario as the data grows; `Mrows` is the rows in the wallet tables of both
+models together:
+
+| level             | Mrows | utxo   | ±   | account | ±   | account vs utxo |
+| ----------------- | ----: | -----: | --: | ------: | --: | --------------: |
+| wallets=1,000     | 0.14  | 57.7µs |     | 45.0µs  |     | -22%            |
+| wallets=10,000    | 0.32  | 59.3µs |     | 45.2µs  | 26% | -24%            |
+| wallets=100,000   | 1.40  | 60.2µs |     | 45.8µs  | 56% | ~ (p=0.065)     |
+| wallets=1,000,000 | 13.12 | 73.9µs |     | 66.5µs  | 29% | ~ (p=0.065)     |
+| outputs=1         | 0.10  | 57.4µs |     | 46.0µs  | 35% | -20%            |
+| outputs=10        | 0.17  | 58.7µs |     | 45.3µs  |     | -23%            |
+| outputs=100       | 0.40  | 61.9µs |     | 45.5µs  | 22% | -26%            |
+| outputs=1,000     | 3.13  | 75.4µs |     | 55.3µs  | 17% | -27%            |
+| history=1         | 0.15  | 57.6µs | 13% | 45.6µs  | 11% | -21%            |
+| history=100       | 0.69  | 58.1µs |     | 45.5µs  |     | -22%            |
+| history=1,000     | 5.11  | 58.7µs |     | 49.7µs  | 25% | ~ (p=0.394)     |
+
+The `outputs` and `history` sweeps run on 1000 wallets; `Mrows` is the utxo
+column of the benchstat summary.
+
+- Both models stay flat up to 100k wallets and slow down at 1M (13M rows):
+  UTXO by 28%.
+- More unspent outputs per wallet cost the UTXO model 31% from 1 to 1000.
+  Closed history costs it nothing measurable.
+- The account model's medians are noisier here: single rounds ran 20 to 55%
+  slow on otherwise flat rows, and at 1M wallets it ranged from 52 to 86µs.
+  Six rounds do not separate the models at 100k and 1M wallets or at
+  history=1000, and do not show how the account model itself scales past
+  100k wallets.
